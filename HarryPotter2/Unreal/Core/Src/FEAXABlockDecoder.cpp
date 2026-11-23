@@ -125,8 +125,11 @@ INT FEAXABlockDecoder::Decode( SWORD* Dest, INT Samples )
 
 		for( INT Index=0; Index<BlockSamples; ++Index )
 		{
+			// EA-XA v2 ("sx -eaxa_blk") stores the HIGH nibble first, as in
+			// vgmstream's decode_ea_xa_v2. Low-nibble-first decodes to
+			// audible crackle on every dialogue line.
 			const BYTE Packed = Block[1 + Index / 2];
-			const INT UnsignedNibble = (Index & 1) ? (Packed >> 4) : (Packed & 15);
+			const INT UnsignedNibble = (Index & 1) ? (Packed & 15) : (Packed >> 4);
 			const INT SignedNibble = UnsignedNibble >= 8 ? UnsignedNibble - 16 : UnsignedNibble;
 			const INT Sample = ScaleNibble( SignedNibble, Range );
 			const long long Accumulator =
