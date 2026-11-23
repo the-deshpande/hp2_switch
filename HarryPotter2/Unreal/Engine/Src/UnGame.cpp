@@ -999,6 +999,31 @@ void UGameEngine::FixUpLevel( )
 	debugf(TEXT("Level is %s"), GLevel->GetFullName());
 
 }
+
+//
+// Fraction of Console.FadeoutTime used for the fade-out drawn before a level
+// is replaced. The stock fade (~0.5 s of wall time) is cut to 25%, which
+// roughly halves saved-game load time (idea from the upstream project's
+// "Faster level loads" change). HP2_LOAD_FADE_SCALE=1 restores the original;
+// any value in (0, 10] is accepted.
+//
+static FLOAT LoadFadeScale()
+{
+	static FLOAT Scale = -1.f;
+	if( Scale < 0.f )
+	{
+		Scale = 0.25f;
+		if( const char* Env = getenv("HP2_LOAD_FADE_SCALE") )
+		{
+			char* End = NULL;
+			const double Value = strtod( Env, &End );
+			if( End != Env && Value > 0.0 && Value <= 10.0 )
+				Scale = (FLOAT)Value;
+		}
+	}
+	return Scale;
+}
+
 //
 // Load a map.
 //
@@ -1038,7 +1063,7 @@ ULevel* UGameEngine::LoadMap( const FURL& URL, UPendingLevel* Pending, const TMa
 			{
 				Draw( Viewport );
 				FTime Cur = appSeconds();
-				Viewport->Actor->FlashFog.W -= (Cur-Prev) / Viewport->Console->FadeoutTime;
+				Viewport->Actor->FlashFog.W -= (Cur-Prev) / (Viewport->Console->FadeoutTime * LoadFadeScale());
 				Prev = Cur;
 			}
 		}
