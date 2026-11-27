@@ -697,7 +697,7 @@ void UXOpenGLRenderDevice::InitShaders()
 	}
 #endif
 
-	LoadShaderCache();
+	const UBOOL ShaderCacheLoaded = LoadShaderCache();
 	RecompileShaders();
 
 #if defined(__SWITCH__)
@@ -775,6 +775,13 @@ void UXOpenGLRenderDevice::InitShaders()
 			Shaders[Complex_Prog]->SelectSpecialization(FogOpt);
 		}
 	}
+	// Persist the warmed-up programs right away when no cache was loaded:
+	// on the Switch the software is usually closed from the HOME menu, and
+	// the save in Exit() may never run.
+	if (!ShaderCacheLoaded)
+		SaveShaderCache();
+#else
+	(void)ShaderCacheLoaded;
 #endif
 
 	unguard;
@@ -826,6 +833,18 @@ static FString& ShaderCacheBuildDate()
 	static FString Cached = appFromAnsi(__DATE__);
 	return Cached;
 }
+
+// The default relative path resolves into the base directory, which is the
+// read-only RomFS on the Switch: the cache could never be written there.
+// Keep it next to the other caches on the SD card.
+static const TCHAR* ShaderCacheFilename()
+{
+#if defined(__SWITCH__)
+	return TEXT("sdmc:/switch/hp2/cache/XOpenGLShaderCache.dat");
+#else
+	return TEXT("XOpenGLShaderCache.dat");
+#endif
+}
 #endif
 
 UBOOL UXOpenGLRenderDevice::SaveShaderCache()
@@ -837,7 +856,7 @@ UBOOL UXOpenGLRenderDevice::SaveShaderCache()
 	if (!UseShaderCache || !glGetProgramBinary)
 		return 0;
 
-	FArchive* Ar = GFileManager->CreateFileWriter(TEXT("XOpenGLShaderCache.dat"));
+	FArchive* Ar = GFileManager->CreateFileWriter(ShaderCacheFilename());
 	if (!Ar)
 		return 0;
 
@@ -892,7 +911,7 @@ UBOOL UXOpenGLRenderDevice::LoadShaderCache()
 	if (!UseShaderCache || !glProgramBinary)
 		return 0;
 
-	FArchive* Ar = GFileManager->CreateFileReader(TEXT("XOpenGLShaderCache.dat"));
+	FArchive* Ar = GFileManager->CreateFileReader(ShaderCacheFilename());
 	if (!Ar)
 		return 0;
 
@@ -999,6 +1018,24 @@ void UXOpenGLRenderDevice::ShaderProgram::RecompileShader(ShaderCompilationOptio
 		return;
 	}
 
+#if defined(__SWITCH__)
+	// First compile after LoadShaderCache: the specializations just loaded
+	// from disk are keyed by their full option mask, so they stay valid for
+	// whatever config is current; clearing them threw the cache away on
+	// every boot. glProgramBinary resets uniform state and the per-
+	// specialization uniform locations were never queried for loaded
+	// programs, so bind their state now (buffers are mapped by the caller).
+	if (!CurrentSpecialization)
+	{
+		for (TOpenGLMap<DWORD, CompiledShader*>::TIterator It(SpecializationCache); It; ++It)
+		{
+			glUseProgram(It.Value()->ShaderProgramObject);
+			BindShaderState(It.Value());
+		}
+		SelectSpecialization(Options);
+		return;
+	}
+#endif
 	// Renderer config changed: every specialization we've cached so far (they were all
 	// built against the old config) is now stale, so throw the whole cache away and let per-draw-call
 	// specialization requests lazily rebuild whatever they actually need under the new config.

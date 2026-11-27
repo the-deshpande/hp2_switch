@@ -15,6 +15,7 @@
 	#include <sys/stat.h>
 	#include <string>
 	extern "C" void SwitchLog(const char* Fmt, ...);
+	extern "C" void SwitchNativeResolution( INT* Width, INT* Height );
 #endif
 #if __UNIX__
 	#include <sys/wait.h>
@@ -288,11 +289,9 @@ void USDLViewport::OpenWindow( DWORD ParentWindow, UBOOL Temporary, INT NewX, IN
 	INT Width  = NewX != INDEX_NONE ? NewX : (OpenX != INDEX_NONE ? OpenX : C->WindowedViewportX);
 	INT Height = NewY != INDEX_NONE ? NewY : (OpenY != INDEX_NONE ? OpenY : C->WindowedViewportY);
 #if defined(__SWITCH__)
-	if( (Width == 1024 && Height == 768) || Width <= 0 || Height <= 0 )
-	{
-		Width = 1280;
-		Height = 720;
-	}
+	// The Switch has no windowed mode: always render at the native size of
+	// the current console mode (1080p docked, 720p handheld).
+	SwitchNativeResolution( &Width, &Height );
 #endif
 #if defined(__EMSCRIPTEN__)
 	BrowserCanvasSize( Width, Height );
@@ -393,6 +392,23 @@ void USDLViewport::UpdateInput( UBOOL Reset )
 		s_SwitchPadInit = true;
 	}
 
+	// Docking or undocking changes the native output size. React only to a
+	// change of the native size, so a resize the render device clamps is not
+	// retried every frame.
+	{
+		static INT s_LastNativeX = 0, s_LastNativeY = 0;
+		INT NativeX = 0, NativeY = 0;
+		SwitchNativeResolution( &NativeX, &NativeY );
+		const bool NativeChanged = (NativeX != s_LastNativeX || NativeY != s_LastNativeY);
+		s_LastNativeX = NativeX;
+		s_LastNativeY = NativeY;
+		if( SdlWindow && NativeChanged && (NativeX != SizeX || NativeY != SizeY) )
+		{
+			SwitchLog( "[SWITCH VIDEO] Output size %ix%i -> %ix%i\n", SizeX, SizeY, NativeX, NativeY );
+			ResizeViewport( BlitFlags, NativeX, NativeY, INDEX_NONE );
+		}
+	}
+
 	padUpdate( &s_SwitchPad );
 	const u64 kDown = padGetButtonsDown( &s_SwitchPad );
 	const u64 kUp   = padGetButtonsUp( &s_SwitchPad );
@@ -461,10 +477,10 @@ void USDLViewport::UpdateInput( UBOOL Reset )
 	};
 
 	// Triggers and Bumpers:
-	// ZL for left click (use wand)
-	HandleBtn( HidNpadButton_ZL, IK_LeftMouse );
-	// ZR for right click (jump)
-	HandleBtn( HidNpadButton_ZR, IK_RightMouse );
+	// ZR for left click (use wand)
+	HandleBtn( HidNpadButton_ZR, IK_LeftMouse );
+	// ZL for right click (jump)
+	HandleBtn( HidNpadButton_ZL, IK_RightMouse );
 	// L for Potion (Space / Q)
 	HandleBtn( HidNpadButton_L, IK_Space );
 	// R for Broom action / Ctrl
@@ -564,6 +580,18 @@ void USDLViewport::UpdateInput( UBOOL Reset )
 			curDeltaY = (FLOAT)r_stick.y / 32767.f;
 		else if( l_stick.y > MOVE_DEADZONE || l_stick.y < -MOVE_DEADZONE )
 			curDeltaY = (FLOAT)l_stick.y / 32767.f;
+
+		// Pause screen only: the cursor was far too fast there. Square the
+		// stick deflection (fine control near the centre) and slow it down;
+		// every path below (console cursor, window cursor, axis events) uses
+		// the scaled deltas.
+		const bool bPaused = Actor && Actor->Level && Actor->Level->Pauser != TEXT("");
+		if( bPaused )
+		{
+			const FLOAT PauseSpeed = 0.4f;
+			curDeltaX *= Abs( curDeltaX ) * PauseSpeed;
+			curDeltaY *= Abs( curDeltaY ) * PauseSpeed;
+		}
 
 		if( curDeltaX != 0.f || curDeltaY != 0.f )
 		{

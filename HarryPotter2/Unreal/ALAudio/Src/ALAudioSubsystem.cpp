@@ -1222,10 +1222,29 @@ INT UALAudioSubsystem::PlayMusic( FString Song, FLOAT FadeInTime )
 		return 0;
 
 	const UBOOL bAppendExt = appStricmp(appFExt(*Song), TEXT("ogg")) != 0;
-	FString Filename = TEXT("..\\music\\");
-	Filename += Song;
+	FString Leaf = Song;
 	if (bAppendExt)
-		Filename += TEXT(".ogg");
+		Leaf += TEXT(".ogg");
+
+	// The stream is opened with a raw appFopen, which does no case recovery.
+	// On case-sensitive filesystems (Switch RomFS, Linux) the folder is
+	// "Music" and song names in maps don't always match the file case, so
+	// resolve the real on-disk name through the file manager first.
+	const TCHAR* MusicDir = TEXT("..\\Music\\");
+	FString Filename = MusicDir;
+	Filename += Leaf;
+	FString Pattern = MusicDir;
+	Pattern += TEXT("*.ogg");
+	TArray<FString> Candidates = GFileManager->FindFiles(*Pattern, 1, 0);
+	for (INT i = 0; i < Candidates.Num(); i++)
+	{
+		if (appStricmp(*Candidates(i), *Leaf) == 0)
+		{
+			Filename = MusicDir;
+			Filename += Candidates(i);
+			break;
+		}
+	}
 
 	debugf(NAME_DevMusic, TEXT("PlayMusic request: %s -> %s"), *Song, *Filename);
 	USound* Music = new USound(*Filename, SF_Streaming | SF_Music);

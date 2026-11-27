@@ -1416,6 +1416,12 @@ FLOAT FLipSyncData::GetMouthPos( FLOAT fTime )
 	const FLOAT kfAnimEndRange = 0.9;
 	const FLOAT kfMuteFactor = 0.7;
 
+	// The amplitude data is a lazy array: make sure it is loaded (a no-op
+	// when it already is) before GetInterpAmplitude indexes it.
+	Load();
+	if( Num() == 0 )
+		return 0.f;
+
 	BYTE	bAmp = GetInterpAmplitude(fTime);
 	BYTE	bMaxAmp = GetMaxAmplitude();
 

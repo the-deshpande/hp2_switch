@@ -2794,6 +2794,31 @@ void URender::OccludeBsp( FSceneNode* Frame )
 					PolyFlags |= Poly->Texture->PolyFlags;
 				PolyFlags &= PolyFlagMask;
 
+#ifndef NO_LUMOS_CODE
+				// A lumos *disappearing* surface not yet touched by Lumos is drawn
+				// opaque and depth-writing (see the lumos draw below), but its
+				// PF_LumosAffected marker contains PF_Modulated, a PF_NoOcclude
+				// bit: it neither occluded the span buffer nor stayed in the opaque
+				// bin, so coplanar or hidden surfaces behind it were drawn too and
+				// z-fought with it (the wall next to the gargoyle glitching until a
+				// Lumos made it vanish). For occlusion and binning only, drop the
+				// marker's modulated bit, as the Rust port does.
+				if( !GIsEditor && !RenDev->SpanBased
+				&&	(PolyFlags & PF_LumosAffected) == PF_LumosAffected
+				&&	!(PolyFlags & (PF_LumosAlwaysOn | PF_LumosAppear))
+				&&	!(PolyFlags & ((PF_NoOcclude & ~PF_Modulated) | PF_Highlighted | PF_FakeBackdrop | PF_Portal | PF_Mirrored)) )
+				{
+					PolyFlags &= ~PF_Modulated;
+					// Local test helper: list each such surface once.
+					static TArray<INT> LoggedLumosSurfs;
+					if( getenv( "HP2_LUMOS_DEBUG" ) && LoggedLumosSurfs.FindItemIndex( Node->iSurf ) == INDEX_NONE )
+					{
+						LoggedLumosSurfs.AddItem( Node->iSurf );
+						debugf( TEXT("HP2_LUMOS: surf %i drawn as opaque occluder (flags 0x%08x)"), Node->iSurf, PolyFlags );
+					}
+				}
+#endif
+
 				// See if we should merge.
 				Mergeable = !(PolyFlags & (PF_NoOcclude|PF_NoMerge|PF_Portal));
 				Merge = NULL;

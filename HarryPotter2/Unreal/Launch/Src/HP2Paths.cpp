@@ -25,6 +25,10 @@
 #include <switch.h>
 extern "C" void SwitchLog(const char* Fmt, ...);
 extern "C" bool GSwitchHasInternalSave;
+#else
+// The Switch boot diagnostics below are not guarded per call; compile them
+// away on the other platforms.
+static inline void SwitchLog(const char*, ...) {}
 #endif
 #if HP2_WINDOWS
 #include <shlobj.h>

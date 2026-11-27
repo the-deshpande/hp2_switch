@@ -164,7 +164,15 @@ CORE_API UBOOL					GIsSlowTask=0;					/* Whether there is a slow task in progres
 CORE_API UBOOL					GIsRequestingExit=0;			/* Indicates that MainLoop() should be exited at the end of the current iteration */
 CORE_API UBOOL					GIsStrict=0;					/* Causes all UnrealScript execution warnings to be fatal errors */
 CORE_API UBOOL					GScriptEntryTag=0;				/* Number of recursive UnrealScript calls currently on the stack */
+#if defined(__SWITCH__)
+// Lazy loading on Switch: with it off, every sound sample, texture mip and
+// mesh vertex array of each package was read and copied as soon as its
+// object loaded (all of HPSounds.u, 44 MB, at boot). The engine calls Load()
+// before using any lazy array, so data is now read on first use instead.
+CORE_API UBOOL					GLazyLoad=1;					/* Whether TLazyLoad arrays should be lazy-loaded or not */
+#else
 CORE_API UBOOL					GLazyLoad=0;					/* Whether TLazyLoad arrays should be lazy-loaded or not */
+#endif
 CORE_API FGlobalMath			GMath;							/* Math code */
 CORE_API URenderDevice*			GRenderDevice=NULL;				/* S3TC Support - Global pointer to current rendering device */
 CORE_API FArchive*				GDummySave=&GArchiveDummySave;	/* No-op save archive */

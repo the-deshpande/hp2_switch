@@ -2227,6 +2227,31 @@ CORE_API void SavePersistentActorCache( void )
 	// *** Save our SavePersistent Actor Cache by copying all cached pa files into our imediate SaveSlotPath.
 	if( !*GSys->SaveSlotPath )
 		return;
+#if 1 // Copy-on-write cache, all platforms (testable on the PC build).
+	// Copy-on-write cache (see LoadPersistentActorCache): the cache holds
+	// only the levels changed since the last save, the slot holds the rest.
+	// Saving moves each cached file over its slot copy (a rename, no data
+	// copy) and leaves the other slot files alone.
+	{
+		const FString CacheSpec = GSys->SaveSlotPath * TEXT("cache") * TEXT("*_pa.*");
+		TArray<FString> Cached = GFileManager->FindFiles( *CacheSpec, true, false );
+		debugf( NAME_Log, TEXT("PA cache: moving %i changed PA files into '%s'"), Cached.Num(), *GSys->SaveSlotPath );
+#if defined(__SWITCH__)
+		SwitchBeginCommitBatch();
+#endif
+		for( INT j=0; Cached.IsValidIndex(j); j++ )
+		{
+			const FString From = GSys->SaveSlotPath * TEXT("cache") * Cached(j);
+			if( GFileManager->FileSize( *From ) > 0 )
+				GFileManager->Move( *(GSys->SaveSlotPath * Cached(j)), *From, 1, 1 );
+		}
+#if defined(__SWITCH__)
+		SwitchEndCommitBatch();
+		SwitchCommitSaveData();
+#endif
+		return;
+	}
+#endif
 
 	FString			Spec  = GSys->SaveSlotPath * TEXT("*_pa.*");
 	TArray<FString> Files = GFileManager->FindFiles( *Spec, true, false );
@@ -2269,6 +2294,26 @@ CORE_API void LoadPersistentActorCache( void )
 	// *** Load our SavePersistent Actor Cache by copying all pa files in our imediate SaveSlotPath into our cache dir
 	if( !*GSys->SaveSlotPath )
 		return;
+#if 1 // Copy-on-write cache, all platforms (testable on the PC build).
+	// Copy-on-write cache: instead of copying every slot PA file into the
+	// cache at each boot and load (~7 MB written and committed, ~1.1 s),
+	// only empty the cache. ULevel::LoadPersistentActors falls back to the
+	// slot file when a level has no cached file yet.
+	{
+		const FString CacheSpec = GSys->SaveSlotPath * TEXT("cache") * TEXT("*.*");
+		TArray<FString> Cached = GFileManager->FindFiles( *CacheSpec, true, false );
+#if defined(__SWITCH__)
+		SwitchBeginCommitBatch();
+#endif
+		for( INT j=0; Cached.IsValidIndex(j); j++ )
+			GFileManager->Delete( *(GSys->SaveSlotPath * TEXT("cache") * Cached(j)), false, true );
+#if defined(__SWITCH__)
+		SwitchEndCommitBatch();
+#endif
+		debugf( NAME_Log, TEXT("PA cache: cleared %i cached PA files (slot files are read on demand)"), Cached.Num() );
+		return;
+	}
+#endif
 	
 	// Delete all cache _pa files
 	FString			Spec  = GSys->SaveSlotPath * TEXT("cache") * TEXT("*.*");

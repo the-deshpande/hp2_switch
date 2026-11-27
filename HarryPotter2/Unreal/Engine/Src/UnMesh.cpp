@@ -54,6 +54,21 @@ void UMesh::Serialize( FArchive& Ar )
 	if( Ar.Ver()>=66 )
 		Ar << TextureLOD;
 
+#if defined(__SWITCH__)
+	// Lazy loading is on for Switch (Core.cpp), but several mesh paths index
+	// Verts/Tris directly without Load() (e.g. the per-frame vertex lookups
+	// in UnMesh.cpp/ULodMesh.cpp): with the vertices left unloaded, Harry's
+	// shadow disappeared. Load mesh arrays eagerly; textures and sounds,
+	// where the savings are, stay lazy.
+	if( Ar.IsLoading() )
+	{
+		Verts.Load();
+		Tris.Load();
+		Connects.Load();
+		VertLinks.Load();
+	}
+#endif
+
 	unguardobj;
 }
 void UMesh::SetScale( FVector NewScale )

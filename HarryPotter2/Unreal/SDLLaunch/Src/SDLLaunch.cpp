@@ -77,168 +77,283 @@ FOutputDeviceStdout StdoutEcho;
 
 extern "C" int setenv(const char *name, const char *value, int overwrite);
 
+/*-----------------------------------------------------------------------------
+	Switch logging.
+
+	Logs never go to the save partition: every byte written there consumes
+	the save journal until the next commit and competes with the actual
+	savegame for space. One log file lives on the SD card:
+	  - NRO: always (the app already owns sdmc:/switch/hp2), fully buffered.
+	  - NSP: only when the marker file sdmc:/switch/hp2/debug_log exists,
+	    line buffered so a hang still leaves a useful log.
+	When no file is open, SwitchLog returns immediately.
+-----------------------------------------------------------------------------*/
+
 extern "C" bool GSwitchHasInternalSave = false;
 extern "C" FILE* GSwitchLogFile = NULL;
-extern "C" FILE* GSwitchSaveLogFile = NULL;
-extern "C" FILE* GSwitchSaveUserLogFile = NULL;
-extern "C" FILE* GSwitchSaveRootLogFile = NULL;
-extern "C" FILE* GSwitchSdLogFile = NULL;
-static char GSwitchEarlyLogBuffer[65536];
-static size_t GSwitchEarlyLogLen = 0;
+static char GSwitchLogBuffer[65536];
+
+static const char* const GSwitchSdDir       = "sdmc:/switch/hp2";
+static const char* const GSwitchLogPath     = "sdmc:/switch/hp2/boot.log";
+static const char* const GSwitchPrevLogPath = "sdmc:/switch/hp2/boot.prev.log";
+static const char* const GSwitchCrashPath   = "sdmc:/switch/hp2/crash.log";
+static const char* const GSwitchDebugMarker = "sdmc:/switch/hp2/debug_log";
+static const char* const GSwitchMesaCache   = "sdmc:/switch/hp2/cache/mesa";
 
 extern "C" void SwitchCommitSaveData( void );
 
+static void SwitchEnsureSdDir( void )
+{
+	mkdir( "sdmc:/switch", 0777 );
+	mkdir( GSwitchSdDir, 0777 );
+}
+
+static void SwitchOpenLogFile( void )
+{
+	struct stat St;
+	const bool DebugMarker = stat( GSwitchDebugMarker, &St ) == 0;
+	if( envIsNso() && !DebugMarker )
+		return;
+	SwitchEnsureSdDir();
+	// Keep the previous session's log: the one where the user played and
+	// saved is otherwise overwritten by the relaunch that checks it.
+	unlink( GSwitchPrevLogPath );
+	rename( GSwitchLogPath, GSwitchPrevLogPath );
+	GSwitchLogFile = fopen( GSwitchLogPath, "w" );
+	if( !GSwitchLogFile )
+		return;
+	// Fully buffered in both modes: a line-buffered write to the SD card
+	// costs ~9 ms, which slowed the debug run and skewed its timings.
+	// SwitchLog flushes at least every 2 s, and save commits, exit and the
+	// crash handler flush too.
+	setvbuf( GSwitchLogFile, GSwitchLogBuffer, _IOFBF, sizeof(GSwitchLogBuffer) );
+}
+
 extern "C" void SwitchLog( const char* Fmt, ... )
 {
-#if defined(__SWITCH__)
+	if( !GSwitchLogFile )
+		return;
+	// Seconds since boot, to see where startup time goes.
+	static const u64 BootTick = armGetSystemTick();
 	char DbgBuf[2048];
+	const int Prefix = snprintf( DbgBuf, sizeof(DbgBuf), "[%8.3f] ",
+		(double)armTicksToNs( armGetSystemTick() - BootTick ) / 1e9 );
 	va_list DbgArgs;
 	va_start( DbgArgs, Fmt );
-	int Len = vsnprintf( DbgBuf, sizeof(DbgBuf), Fmt, DbgArgs );
+	vsnprintf( DbgBuf + Prefix, sizeof(DbgBuf) - Prefix, Fmt, DbgArgs );
 	va_end( DbgArgs );
 	svcOutputDebugString( DbgBuf, strlen(DbgBuf) );
-
-	bool HasFile = false;
-	if( GSwitchSaveLogFile )     { fputs( DbgBuf, GSwitchSaveLogFile ); fflush( GSwitchSaveLogFile ); HasFile = true; }
-	if( GSwitchSaveUserLogFile ) { fputs( DbgBuf, GSwitchSaveUserLogFile ); fflush( GSwitchSaveUserLogFile ); HasFile = true; }
-	if( GSwitchSaveRootLogFile ) { fputs( DbgBuf, GSwitchSaveRootLogFile ); fflush( GSwitchSaveRootLogFile ); HasFile = true; }
-	if( GSwitchSdLogFile )       { fputs( DbgBuf, GSwitchSdLogFile ); fflush( GSwitchSdLogFile ); HasFile = true; }
-	if( GSwitchLogFile && !HasFile ) { fputs( DbgBuf, GSwitchLogFile ); fflush( GSwitchLogFile ); HasFile = true; }
-
-	if( !HasFile && Len > 0 && GSwitchEarlyLogLen + (size_t)Len < sizeof(GSwitchEarlyLogBuffer) - 1 )
+	fputs( DbgBuf, GSwitchLogFile );
+	static u64 LastFlushTick = 0;
+	const u64 Now = armGetSystemTick();
+	if( armTicksToNs( Now - LastFlushTick ) > 2000000000ULL )
 	{
-		memcpy( GSwitchEarlyLogBuffer + GSwitchEarlyLogLen, DbgBuf, Len );
-		GSwitchEarlyLogLen += Len;
-		GSwitchEarlyLogBuffer[GSwitchEarlyLogLen] = 0;
+		fflush( GSwitchLogFile );
+		LastFlushTick = Now;
 	}
-#endif
 }
+
+extern "C" long long GSwitchReadNs = 0, GSwitchReadBytes = 0, GSwitchReadCalls = 0;
+extern "C" long long GSwitchReadCacheBytes = 0;
+
+extern "C" int SwitchLogEnabled( void )
+{
+	return GSwitchLogFile != NULL;
+}
+
+static void SwitchFlushLog( void )
+{
+	if( GSwitchLogFile )
+		fflush( GSwitchLogFile );
+}
+
+/*-----------------------------------------------------------------------------
+	Switch performance profile.
+
+	The previous GPU configuration and CPU clock are read before boosting and
+	restored on exit, instead of hard-coding "stock" values that are wrong in
+	docked mode. The boost is re-applied after resume from sleep, which resets
+	clocks.
+-----------------------------------------------------------------------------*/
 
 static bool GSwitchApmInited = false;
 static bool GSwitchClkrstInited = false;
 static ClkrstSession GSwitchClkCpu;
+static u32 GSwitchPrevApmConfig = 0;
+static u32 GSwitchPrevCpuHz = 0;
 
-extern "C" void SwitchApplyPerformanceProfile( void )
+static const u32 GSwitchBoostApmConfig = 0x00020004; // handheld: GPU 384 MHz, EMC 1600 MHz
+static const u32 GSwitchBoostCpuHz     = 1224000000u;
+
+static void SwitchApplyClocks( void )
 {
-	// 1. Setup Mesa and system shader cache directories
-	const bool UseInternalSave = (envIsNso() || GSwitchHasInternalSave);
-	const char* CacheDir = UseInternalSave ? "save:/User/Cache/mesa" : "sdmc:/switch/hp2/cache/mesa";
-	const char* XdgCache = UseInternalSave ? "save:/User/Cache" : "sdmc:/switch/hp2/cache";
-	if( UseInternalSave )
-	{
-		mkdir( "save:/User", 0777 );
-		mkdir( "save:/User/Cache", 0777 );
-		mkdir( "save:/User/Cache/mesa", 0777 );
-	}
-	else
-	{
-		mkdir( "sdmc:/switch", 0777 );
-		mkdir( "sdmc:/switch/hp2", 0777 );
-		mkdir( "sdmc:/switch/hp2/cache", 0777 );
-		mkdir( "sdmc:/switch/hp2/cache/mesa", 0777 );
-	}
-	setenv( "MESA_SHADER_CACHE_DIR", CacheDir, 1 );
-	setenv( "MESA_SHADER_CACHE_DISABLE", "0", 1 );
-	setenv( "MESA_GLSL_CACHE_DIR", CacheDir, 1 );
-	setenv( "MESA_GLSL_CACHE_MAX_SIZE", "128MB", 1 );
-	setenv( "XDG_CACHE_HOME", XdgCache, 1 );
-	setenv( "ALSOFT_CONF", "romfs:/alsoft.conf", 1 );
-
-	// 2. APM: GPU performance configuration
-	// 0x00020004: Official Boost handheld profile (GPU 384 MHz, EMC 1600 MHz)
-	if( !GSwitchApmInited )
-	{
-		if( R_SUCCEEDED(apmInitialize()) )
-			GSwitchApmInited = true;
-	}
 	if( GSwitchApmInited )
 	{
-		Result rc = apmSetPerformanceConfiguration( ApmPerformanceMode_Normal, 0x00020004 );
-		SwitchLog( "[SWITCH PERF] apmSetPerformanceConfiguration(Normal, 0x00020004): 0x%x\n", (unsigned)rc );
-	}
-
-	// 3. clkrst: CPU clock rate (1224 MHz - rock solid handheld clock that prevents hitches)
-	if( !GSwitchClkrstInited )
-	{
-		if( hosversionAtLeast(8, 0, 0) && R_SUCCEEDED(clkrstInitialize()) )
-		{
-			if( R_SUCCEEDED(clkrstOpenSession(&GSwitchClkCpu, PcvModuleId_CpuBus, 3)) )
-				GSwitchClkrstInited = true;
-		}
+		Result rc = apmSetPerformanceConfiguration( ApmPerformanceMode_Normal, GSwitchBoostApmConfig );
+		SwitchLog( "[SWITCH PERF] apmSetPerformanceConfiguration(Normal, 0x%08x): 0x%x\n", GSwitchBoostApmConfig, (unsigned)rc );
 	}
 	if( GSwitchClkrstInited )
 	{
-		Result rc = clkrstSetClockRate( &GSwitchClkCpu, 1224000000u );
-		u32 Actual = 0;
-		clkrstGetClockRate( &GSwitchClkCpu, &Actual );
-		SwitchLog( "[SWITCH PERF] clkrstSetClockRate(1224 MHz): 0x%x, actual: %.1f MHz\n", (unsigned)rc, Actual / 1e6 );
+		Result rc = clkrstSetClockRate( &GSwitchClkCpu, GSwitchBoostCpuHz );
+		SwitchLog( "[SWITCH PERF] clkrstSetClockRate(%u Hz): 0x%x\n", GSwitchBoostCpuHz, (unsigned)rc );
 	}
+}
+
+extern "C" void SwitchApplyPerformanceProfile( void )
+{
+	// Mesa shader cache on the SD card: it can grow far beyond the save
+	// partition and must never consume the save journal.
+	SwitchEnsureSdDir();
+	mkdir( "sdmc:/switch/hp2/cache", 0777 );
+	mkdir( GSwitchMesaCache, 0777 );
+	setenv( "MESA_SHADER_CACHE_DIR", GSwitchMesaCache, 1 );
+	setenv( "MESA_SHADER_CACHE_DISABLE", "0", 1 );
+	setenv( "MESA_GLSL_CACHE_DIR", GSwitchMesaCache, 1 );
+	setenv( "MESA_GLSL_CACHE_MAX_SIZE", "64MB", 1 );
+	setenv( "XDG_CACHE_HOME", "sdmc:/switch/hp2/cache", 1 );
+	setenv( "ALSOFT_CONF", "romfs:/alsoft.conf", 1 );
+
+	if( !GSwitchApmInited && R_SUCCEEDED(apmInitialize()) )
+	{
+		GSwitchApmInited = true;
+		if( R_FAILED(apmGetPerformanceConfiguration( ApmPerformanceMode_Normal, &GSwitchPrevApmConfig )) )
+			GSwitchPrevApmConfig = 0;
+	}
+	if( !GSwitchClkrstInited && hosversionAtLeast(8, 0, 0) && R_SUCCEEDED(clkrstInitialize()) )
+	{
+		if( R_SUCCEEDED(clkrstOpenSession(&GSwitchClkCpu, PcvModuleId_CpuBus, 3)) )
+		{
+			GSwitchClkrstInited = true;
+			if( R_FAILED(clkrstGetClockRate( &GSwitchClkCpu, &GSwitchPrevCpuHz )) )
+				GSwitchPrevCpuHz = 0;
+		}
+		else
+		{
+			clkrstExit();
+		}
+	}
+	SwitchApplyClocks();
 }
 
 extern "C" void SwitchRestorePerformanceProfile( void )
 {
 	if( GSwitchClkrstInited )
 	{
-		clkrstSetClockRate( &GSwitchClkCpu, 1020000000u );
+		if( GSwitchPrevCpuHz )
+			clkrstSetClockRate( &GSwitchClkCpu, GSwitchPrevCpuHz );
 		clkrstCloseSession( &GSwitchClkCpu );
 		clkrstExit();
 		GSwitchClkrstInited = false;
-		SwitchLog( "[SWITCH PERF] Restored CPU clock to stock (1020 MHz)\n" );
+		SwitchLog( "[SWITCH PERF] Restored CPU clock to %u Hz\n", GSwitchPrevCpuHz );
 	}
 	if( GSwitchApmInited )
 	{
-		apmSetPerformanceConfiguration( ApmPerformanceMode_Normal, 0x00020003 );
+		if( GSwitchPrevApmConfig )
+			apmSetPerformanceConfiguration( ApmPerformanceMode_Normal, GSwitchPrevApmConfig );
 		apmExit();
 		GSwitchApmInited = false;
-		SwitchLog( "[SWITCH PERF] Restored GPU profile to stock (307 MHz)\n" );
+		SwitchLog( "[SWITCH PERF] Restored APM configuration 0x%08x\n", GSwitchPrevApmConfig );
 	}
 }
 
+/*-----------------------------------------------------------------------------
+	Switch save data.
+-----------------------------------------------------------------------------*/
+
+// Savegames of this engine family weigh several MB (HP3 saves reach ~9 MB),
+// and a whole savegame is written before the commit, so the journal must
+// hold it. Keep in sync with scripts/build_nsp.py.
+static const s64 GSwitchSaveDataSize    = 64 * 1024 * 1024;
+static const s64 GSwitchSaveJournalSize = 16 * 1024 * 1024;
+static const char* const GSwitchSaveLayoutMarker = "save:/.layout_v2";
+
+// Each commit costs ~40 ms. Inside a batch, commits are deferred and done
+// once at the end.
+static int GSwitchCommitBatchDepth = 0;
+static bool GSwitchCommitPending = false;
+
 extern "C" void SwitchCommitSaveData( void )
 {
-#if defined(__SWITCH__)
-	if( GSwitchSaveLogFile )     fflush( GSwitchSaveLogFile );
-	if( GSwitchSaveUserLogFile ) fflush( GSwitchSaveUserLogFile );
-	if( GSwitchSaveRootLogFile ) fflush( GSwitchSaveRootLogFile );
-	if( GSwitchSdLogFile )       fflush( GSwitchSdLogFile );
-	if( GSwitchLogFile )         fflush( GSwitchLogFile );
-
+	SwitchFlushLog();
+	if( GSwitchCommitBatchDepth > 0 )
+	{
+		GSwitchCommitPending = true;
+		return;
+	}
 	if( GSwitchHasInternalSave )
 	{
 		Result rc = fsdevCommitDevice( "save" );
 		if( R_FAILED(rc) )
-		{
-			svcOutputDebugString( "[SWITCH SAVE ERROR] fsdevCommitDevice('save') failed!\n", 50 );
-		}
+			SwitchLog( "[SWITCH SAVE ERROR] fsdevCommitDevice('save') failed: 0x%x\n", (unsigned)rc );
 	}
-#endif
+}
+
+extern "C" void SwitchBeginCommitBatch( void )
+{
+	++GSwitchCommitBatchDepth;
+}
+
+extern "C" void SwitchEndCommitBatch( void )
+{
+	if( GSwitchCommitBatchDepth > 0 && --GSwitchCommitBatchDepth == 0 && GSwitchCommitPending )
+	{
+		GSwitchCommitPending = false;
+		SwitchCommitSaveData();
+	}
+}
+
+// Commits only when Path is on the save device: writes to the SD card or
+// romfs need no commit, and each commit costs several milliseconds.
+extern "C" void SwitchCommitSaveDataForPath( const char* Path )
+{
+	if( Path && strncmp( Path, "save:", 5 ) == 0 )
+		SwitchCommitSaveData();
+}
+
+// Saves created by older builds have a 32 MB partition with a 2 MB journal,
+// too small for a full savegame. Grow them once to the current layout. The
+// save must be unmounted while it is extended.
+static bool SwitchExtendExistingSave( u64 AppId, AccountUid Uid )
+{
+	FsSaveDataInfoReader Reader;
+	if( R_FAILED(fsOpenSaveDataInfoReader( &Reader, FsSaveDataSpaceId_User )) )
+		return false;
+	bool Extended = false;
+	FsSaveDataInfo Info;
+	s64 Total = 0;
+	while( R_SUCCEEDED(fsSaveDataInfoReaderRead( &Reader, &Info, 1, &Total )) && Total > 0 )
+	{
+		if( Info.application_id != AppId || Info.save_data_type != FsSaveDataType_Account )
+			continue;
+		if( memcmp( &Info.uid, &Uid, sizeof(Uid) ) != 0 )
+			continue;
+		Result rc = fsExtendSaveDataFileSystem( FsSaveDataSpaceId_User, Info.save_data_id, GSwitchSaveDataSize, GSwitchSaveJournalSize );
+		SwitchLog( "[SWITCH SAVE] fsExtendSaveDataFileSystem(0x%016llx, %lld, %lld) returned 0x%x\n",
+			(unsigned long long)Info.save_data_id, (long long)GSwitchSaveDataSize, (long long)GSwitchSaveJournalSize, (unsigned)rc );
+		Extended = R_SUCCEEDED(rc);
+		break;
+	}
+	fsSaveDataInfoReaderClose( &Reader );
+	return Extended;
+}
+
+static void SwitchMarkSaveLayout( void )
+{
+	FILE* Marker = fopen( GSwitchSaveLayoutMarker, "wb" );
+	if( Marker )
+	{
+		fclose( Marker );
+		SwitchCommitSaveData();
+	}
 }
 
 extern "C" void SwitchInitSaveData( void )
 {
-#if defined(__SWITCH__)
 	if( !envIsNso() )
 	{
 		SwitchLog( "[SWITCH SAVE] Running as NRO: using SD card storage ('sdmc:/switch/hp2')\n" );
 		GSwitchHasInternalSave = false;
-		mkdir( "sdmc:/switch", 0777 );
-		mkdir( "sdmc:/switch/hp2", 0777 );
-		mkdir( "sdmc:/switch/hp2/cache", 0777 );
-		mkdir( "sdmc:/switch/hp2/cache/mesa", 0777 );
-		GSwitchSdLogFile = fopen( "sdmc:/switch/hp2/boot.log", "w" );
-		FILE* RootSd = fopen( "sdmc:/hp2_boot.log", "w" );
-		GSwitchLogFile = GSwitchSdLogFile ? GSwitchSdLogFile : RootSd;
-		if( GSwitchLogFile )
-		{
-			setvbuf( GSwitchLogFile, NULL, _IONBF, 0 );
-			if( GSwitchEarlyLogLen > 0 )
-			{
-				fwrite( GSwitchEarlyLogBuffer, 1, GSwitchEarlyLogLen, GSwitchLogFile );
-				GSwitchEarlyLogLen = 0;
-			}
-			fputs( "[SWITCH LOG] Logging initialized to 'sdmc:/switch/hp2/boot.log'\n", GSwitchLogFile );
-			fflush( GSwitchLogFile );
-		}
+		SwitchEnsureSdDir();
 		return;
 	}
 
@@ -246,59 +361,28 @@ extern "C" void SwitchInitSaveData( void )
 	Result r_rc = romfsInit();
 	SwitchLog( "[SWITCH ROMFS] romfsInit returned 0x%x\n", (unsigned)r_rc );
 
-	// Also attempt to open fail-safe SD root log so user can inspect log directly from SD card
-	if( !GSwitchSdLogFile )
-	{
-		GSwitchSdLogFile = fopen( "sdmc:/hp2_boot.log", "w" );
-		if( GSwitchSdLogFile )
-		{
-			setvbuf( GSwitchSdLogFile, NULL, _IONBF, 0 );
-			if( GSwitchEarlyLogLen > 0 )
-			{
-				fwrite( GSwitchEarlyLogBuffer, 1, GSwitchEarlyLogLen, GSwitchSdLogFile );
-			}
-			fputs( "[SWITCH LOG] Direct SD log opened at 'sdmc:/hp2_boot.log'\n", GSwitchSdLogFile );
-			fflush( GSwitchSdLogFile );
-		}
-	}
-
 	AccountUid uid = {0};
 	if( R_SUCCEEDED(accountInitialize(AccountServiceType_Application)) )
 	{
 		Result a_rc = accountGetPreselectedUser(&uid);
-		SwitchLog( "[SWITCH ACCOUNT] accountGetPreselectedUser returned 0x%x, uid = %016llx%016llx\n",
-			(unsigned)a_rc, (unsigned long long)uid.uid[0], (unsigned long long)uid.uid[1] );
 		if( R_FAILED(a_rc) )
-		{
 			a_rc = accountGetLastOpenedUser(&uid);
-			SwitchLog( "[SWITCH ACCOUNT] accountGetLastOpenedUser returned 0x%x, uid = %016llx%016llx\n",
-				(unsigned)a_rc, (unsigned long long)uid.uid[0], (unsigned long long)uid.uid[1] );
-		}
 		if( R_FAILED(a_rc) )
 		{
 			s32 total = 0;
-			if( R_SUCCEEDED(accountListAllUsers(&uid, 1, &total)) && total > 0 )
-			{
-				SwitchLog( "[SWITCH ACCOUNT] accountListAllUsers found %d users, using uid = %016llx%016llx\n",
-					total, (unsigned long long)uid.uid[0], (unsigned long long)uid.uid[1] );
-			}
+			accountListAllUsers(&uid, 1, &total);
 		}
 		accountExit();
 	}
 	u64 app_id = 0x0100485032000000ULL;
 	u64 cur_app_id = 0;
 	if( R_SUCCEEDED(svcGetInfo(&cur_app_id, InfoType_ProgramId, CUR_PROCESS_HANDLE, 0)) && cur_app_id != 0 )
-	{
 		app_id = cur_app_id;
-	}
 	SwitchLog( "[SWITCH SAVE] Using app_id = 0x%016llx\n", (unsigned long long)app_id );
+
 	Result rc = fsdevMountSaveData( "save", app_id, uid );
 	SwitchLog( "[SWITCH SAVE] fsdevMountSaveData returned 0x%x\n", (unsigned)rc );
-	if( R_FAILED(rc) )
-	{
-		rc = fsdevMountDeviceSaveData( "save", app_id );
-		SwitchLog( "[SWITCH SAVE] fsdevMountDeviceSaveData returned 0x%x\n", (unsigned)rc );
-	}
+	bool Created = false;
 	if( R_FAILED(rc) )
 	{
 		FsSaveDataAttribute attr;
@@ -313,8 +397,8 @@ extern "C" void SwitchInitSaveData( void )
 		attr.save_data_type = FsSaveDataType_Account;
 		attr.save_data_rank = FsSaveDataRank_Primary;
 
-		info.save_data_size = 32 * 1024 * 1024; // 32MB save allocation
-		info.journal_size = 2 * 1024 * 1024; // 2MB journal
+		info.save_data_size = GSwitchSaveDataSize;
+		info.journal_size = GSwitchSaveJournalSize;
 		info.owner_id = app_id;
 		info.save_data_space_id = FsSaveDataSpaceId_User;
 
@@ -322,42 +406,127 @@ extern "C" void SwitchInitSaveData( void )
 		SwitchLog( "[SWITCH SAVE] fsCreateSaveDataFileSystem returned 0x%x\n", (unsigned)c_rc );
 		rc = fsdevMountSaveData( "save", app_id, uid );
 		SwitchLog( "[SWITCH SAVE] fsdevMountSaveData retry returned 0x%x\n", (unsigned)rc );
+		Created = R_SUCCEEDED(c_rc);
 	}
 
 	if( R_SUCCEEDED(rc) )
 	{
 		GSwitchHasInternalSave = true;
-		SwitchLog( "[SWITCH SAVE] Successfully mounted internal save data to 'save:/'\n" );
+		struct stat St;
+		if( Created )
+		{
+			SwitchMarkSaveLayout();
+		}
+		else if( stat( GSwitchSaveLayoutMarker, &St ) != 0 )
+		{
+			fsdevUnmountDevice( "save" );
+			GSwitchHasInternalSave = false;
+			const bool Extended = SwitchExtendExistingSave( app_id, uid );
+			rc = fsdevMountSaveData( "save", app_id, uid );
+			SwitchLog( "[SWITCH SAVE] remount after extend returned 0x%x\n", (unsigned)rc );
+			GSwitchHasInternalSave = R_SUCCEEDED(rc);
+			if( GSwitchHasInternalSave && Extended )
+				SwitchMarkSaveLayout();
+		}
+	}
+
+	if( GSwitchHasInternalSave )
+	{
+		SwitchLog( "[SWITCH SAVE] Internal save data mounted at 'save:/'\n" );
 		mkdir( "save:/User", 0777 );
 		mkdir( "save:/User/Save", 0777 );
 		mkdir( "save:/User/Save/Slot0", 0777 );
 		mkdir( "save:/User/Save/cache", 0777 );
-		mkdir( "save:/User/Cache", 0777 );
-		mkdir( "save:/User/Cache/mesa", 0777 );
-
-		// Open log files in user saves directory, user root, and save partition root
-		GSwitchSaveLogFile     = fopen( "save:/User/Save/boot.log", "w" );
-		GSwitchSaveUserLogFile = fopen( "save:/User/boot.log", "w" );
-		GSwitchSaveRootLogFile = fopen( "save:/boot.log", "w" );
-		GSwitchLogFile = GSwitchSaveLogFile ? GSwitchSaveLogFile : GSwitchSaveRootLogFile;
-
-		if( GSwitchEarlyLogLen > 0 )
-		{
-			if( GSwitchSaveLogFile )     fwrite( GSwitchEarlyLogBuffer, 1, GSwitchEarlyLogLen, GSwitchSaveLogFile );
-			if( GSwitchSaveUserLogFile ) fwrite( GSwitchEarlyLogBuffer, 1, GSwitchEarlyLogLen, GSwitchSaveUserLogFile );
-			if( GSwitchSaveRootLogFile ) fwrite( GSwitchEarlyLogBuffer, 1, GSwitchEarlyLogLen, GSwitchSaveRootLogFile );
-			GSwitchEarlyLogLen = 0;
-		}
-
-		SwitchLog( "[SWITCH LOG] Logging initialized to 'save:/User/Save/boot.log', 'save:/User/boot.log', 'save:/boot.log', 'sdmc:/hp2_boot.log'\n" );
+		// Logs written by older builds lived in the save partition.
+		unlink( "save:/boot.log" );
+		unlink( "save:/User/boot.log" );
+		unlink( "save:/User/Save/boot.log" );
+		unlink( "save:/crash.log" );
 		SwitchCommitSaveData();
 	}
 	else
 	{
-		GSwitchHasInternalSave = false;
-		SwitchLog( "[SWITCH SAVE] Internal save mount failed (0x%x). Running in NRO mode ('sdmc:/switch/hp2/User/Save')\n", (unsigned)rc );
+		SwitchLog( "[SWITCH SAVE] Internal save mount failed (0x%x). Falling back to SD card ('sdmc:/switch/hp2/User/Save')\n", (unsigned)rc );
 	}
-#endif
+}
+
+/*-----------------------------------------------------------------------------
+	Switch applet events: background, resume from sleep, dock changes.
+	Hooks run from appletMainLoop on the game thread.
+-----------------------------------------------------------------------------*/
+
+static AppletHookCookie GSwitchAppletCookie;
+static bool GSwitchAppletHooked = false;
+
+static void SwitchAppletHook( AppletHookType Hook, void* )
+{
+	switch( Hook )
+	{
+		case AppletHookType_OnFocusState:
+			if( appletGetFocusState() != AppletFocusState_InFocus )
+			{
+				// HOME menu or sleep: persist settings now, the user may
+				// close the software from there.
+				SwitchLog( "[SWITCH APPLET] Lost focus: flushing config and save data\n" );
+				if( GConfig )
+					GConfig->Flush( 0 );
+				SwitchCommitSaveData();
+			}
+			break;
+		case AppletHookType_OnResume:
+			SwitchLog( "[SWITCH APPLET] Resumed from sleep: re-applying clocks\n" );
+			SwitchApplyClocks();
+			break;
+		default:
+			break;
+	}
+}
+
+extern "C" void SwitchInstallAppletHooks( void )
+{
+	if( GSwitchAppletHooked )
+		return;
+	appletHook( &GSwitchAppletCookie, SwitchAppletHook, NULL );
+	GSwitchAppletHooked = true;
+}
+
+extern "C" void SwitchRemoveAppletHooks( void )
+{
+	if( !GSwitchAppletHooked )
+		return;
+	appletUnhook( &GSwitchAppletCookie );
+	GSwitchAppletHooked = false;
+}
+
+// Auto-load boot-loop guard (see the launch decision in RealMain).
+static std::string GSwitchAutoLoadMarker;
+
+static void SwitchSetAutoLoadMarker( const char* Path )
+{
+	GSwitchAutoLoadMarker = Path;
+}
+
+extern "C" void SwitchAutoLoadSucceeded( void )
+{
+	if( GSwitchAutoLoadMarker.empty() )
+		return;
+	unlink( GSwitchAutoLoadMarker.c_str() );
+	SwitchCommitSaveDataForPath( GSwitchAutoLoadMarker.c_str() );
+	SwitchLog( "[SWITCH SAVE] Auto-load succeeded; cleared '%s'\n", GSwitchAutoLoadMarker.c_str() );
+	GSwitchAutoLoadMarker.clear();
+}
+
+// Native output size for the current console mode: 1920x1080 docked,
+// 1280x720 handheld. Set [SDLDrv.SDLClient] SwitchDockedFullHD=False to keep
+// 720p when docked.
+extern "C" void SwitchNativeResolution( INT* Width, INT* Height )
+{
+	UBOOL FullHD = 1;
+	if( GConfig )
+		GConfig->GetBool( TEXT("SDLDrv.SDLClient"), TEXT("SwitchDockedFullHD"), FullHD, TEXT("System") );
+	const bool Docked = appletGetOperationMode() == AppletOperationMode_Console;
+	*Width  = (Docked && FullHD) ? 1920 : 1280;
+	*Height = (Docked && FullHD) ? 1080 : 720;
 }
 
 class FSwitchEarlyMalloc final : public FMalloc
@@ -374,66 +543,41 @@ public:
 
 static FSwitchEarlyMalloc GSwitchEarlyMalloc;
 
+// Keep the HOME-menu startup animation (StartupMovie.gif, LogoHandling =
+// Manual in the NACP) on screen while the engine boots and loads the first
+// level, instead of showing the engine's black loading frames. libnx would
+// otherwise call appletNotifyRunning() from appletInitialize; the game calls
+// it from SwitchNotifyRunningIfReady once a playable level is up.
+extern "C" bool __nx_applet_auto_notifyrunning = false;
+static bool GSwitchNotifiedRunning = false;
+
+extern "C" void SwitchNotifyRunning( void )
+{
+	if( GSwitchNotifiedRunning )
+		return;
+	GSwitchNotifiedRunning = true;
+	bool Out = false;
+	appletNotifyRunning( &Out );
+	SwitchLog( "[SWITCH] Startup logo released (appletNotifyRunning)\n" );
+}
+
 extern "C" void userAppInit( void )
 {
 	GMalloc = &GSwitchEarlyMalloc;
-	// Early open of SD log if SDMC is available
-	GSwitchSdLogFile = fopen( "sdmc:/hp2_boot.log", "w" );
-	if( GSwitchSdLogFile )
-		setvbuf( GSwitchSdLogFile, NULL, _IONBF, 0 );
+	SwitchOpenLogFile();
 	SwitchLog( "=== Harry Potter 2 Nintendo Switch Boot Log ===\n" );
-	SwitchLog( "[SWITCH STAGE 1] userAppInit: libnx services and SDMC initialized, early GMalloc active.\n" );
 }
 
 extern "C" void userAppExit( void )
 {
-	SwitchLog( "[SWITCH STAGE X] userAppExit called.\n" );
+	SwitchLog( "[SWITCH] userAppExit called.\n" );
 	if( GConfig )
 		GConfig->Flush( 0 );
 	SwitchCommitSaveData();
-	if( GSwitchSaveLogFile )     { fclose( GSwitchSaveLogFile );     GSwitchSaveLogFile = NULL; }
-	if( GSwitchSaveUserLogFile ) { fclose( GSwitchSaveUserLogFile ); GSwitchSaveUserLogFile = NULL; }
-	if( GSwitchSaveRootLogFile ) { fclose( GSwitchSaveRootLogFile ); GSwitchSaveRootLogFile = NULL; }
-	if( GSwitchSdLogFile )       { fclose( GSwitchSdLogFile );       GSwitchSdLogFile = NULL; }
-	GSwitchLogFile = NULL;
-}
-
-extern "C" {
-	extern void (*__preinit_array_start []) (void) __attribute__((weak));
-	extern void (*__preinit_array_end []) (void) __attribute__((weak));
-	extern void (*__init_array_start []) (void) __attribute__((weak));
-	extern void (*__init_array_end []) (void) __attribute__((weak));
-	extern void _init(void);
-
-	void __libc_init_array(void)
+	if( GSwitchLogFile )
 	{
-		SwitchLog("[SWITCH INIT] Overridden __libc_init_array started.\n");
-
-		size_t pre_count = __preinit_array_end - __preinit_array_start;
-		if( pre_count > 0 )
-		{
-			SwitchLog("[SWITCH INIT] Executing %zu preinit initializers...\n", pre_count);
-			for (size_t i = 0; i < pre_count; i++)
-			{
-				SwitchLog("  [preinit %zu/%zu] Calling %p...", i, pre_count, (void*)__preinit_array_start[i]);
-				__preinit_array_start[i]();
-				SwitchLog(" done.\n");
-			}
-		}
-
-		SwitchLog("[SWITCH INIT] Calling _init()...\n");
-		_init();
-		SwitchLog("[SWITCH INIT] _init() done.\n");
-
-		size_t count = __init_array_end - __init_array_start;
-		SwitchLog("[SWITCH INIT] Executing %zu initializers in .init_array...\n", count);
-		for (size_t i = 0; i < count; i++)
-		{
-			SwitchLog("  [init %02zu/%02zu] Calling %p...", i, count, (void*)__init_array_start[i]);
-			__init_array_start[i]();
-			SwitchLog(" done.\n");
-		}
-		SwitchLog("[SWITCH INIT] All constructors completed! Handing off to main()...\n");
+		fclose( GSwitchLogFile );
+		GSwitchLogFile = NULL;
 	}
 }
 
@@ -464,41 +608,20 @@ extern "C" void __libnx_exception_handler(ThreadExceptionDump *ctx)
 		(unsigned)ctx->pstate
 	);
 	svcOutputDebugString(Buf, strlen(Buf));
-	if (!envIsNso())
+	// Crash dumps go to the SD card in both modes: a write to save:/ would
+	// be lost without a commit, and committing here could persist a
+	// half-written savegame.
+	SwitchEnsureSdDir();
+	FILE* F = fopen(GSwitchCrashPath, "w");
+	if (F)
 	{
-		mkdir("sdmc:/switch", 0777);
-		mkdir("sdmc:/switch/hp2", 0777);
-		FILE* F = fopen("sdmc:/switch/hp2/crash.log", "w");
-		if (F)
-		{
-			fputs(Buf, F);
-			for (int i = 0; i < 29; i++)
-				fprintf(F, "X[%02d]: 0x%016llx\n", i, (unsigned long long)ctx->cpu_gprs[i].x);
-			fclose(F);
-		}
-	}
-	else if (GSwitchHasInternalSave)
-	{
-		FILE* F = fopen("save:/crash.log", "w");
-		if (F)
-		{
-			fputs(Buf, F);
-			for (int i = 0; i < 29; i++)
-				fprintf(F, "X[%02d]: 0x%016llx\n", i, (unsigned long long)ctx->cpu_gprs[i].x);
-			fclose(F);
-		}
+		fputs(Buf, F);
+		for (int i = 0; i < 29; i++)
+			fprintf(F, "X[%02d]: 0x%016llx\n", i, (unsigned long long)ctx->cpu_gprs[i].x);
+		fclose(F);
 	}
 	SwitchLog("%s", Buf);
-	for(int i = 0; i < 28; i += 2)
-	{
-		SwitchLog("  x%d: 0x%016lx  x%d: 0x%016lx\n",
-			i, (unsigned long)ctx->cpu_gprs[i].x,
-			i+1, (unsigned long)ctx->cpu_gprs[i+1].x);
-	}
-	if( GSwitchLogFile )
-	{
-		fflush( GSwitchLogFile );
-	}
+	SwitchFlushLog();
 	svcBreak(0, 0, 0);
 }
 #endif
@@ -5684,8 +5807,216 @@ static void MainLoopBegin( FMainLoopState& S )
 	S.TraceTickIndex = 0;
 }
 
+// Local test helper: HP2_AUTOSHOT="5,12.5" takes an in-game screenshot
+// (console SHOT, saved as Shot####.bmp in the user directory) at each of
+// these seconds after the main loop starts; HP2_AUTOQUIT=20 exits then.
+// Lets renderer changes be checked on the PC without anyone at the pad.
+static void AutoShotTick( UEngine* Engine )
+{
+	static FTime Start = appSeconds();
+	static const char* Shots = getenv( "HP2_AUTOSHOT" );
+	static const char* Quit = getenv( "HP2_AUTOQUIT" );
+	if( !Shots && !Quit )
+		return;
+	const double Elapsed = appSeconds() - Start;
+	// HP2_GOTO=<class substring> (with HP2_GOTO_AT seconds, default 6):
+	// put the player next to the first actor whose class name contains it,
+	// e.g. HP2_GOTO=Chest, so a given prop can be captured.
+	// HP2_SKIP="3,5": hold Enter (bound to "button bSkipCutScene") for
+	// 0.3 s at these seconds. A press and release in the same tick is never
+	// seen by script, which reads the button on the following tick.
+	static const char* Skips = getenv( "HP2_SKIP" );
+	static double SkipRelease = -1.0;
+	UViewport* SkipViewport = (Engine && Engine->Client && Engine->Client->Viewports.Num()) ? Engine->Client->Viewports(0) : NULL;
+	if( SkipRelease >= 0.0 && Elapsed >= SkipRelease )
+	{
+		if( SkipViewport )
+			Engine->InputEvent( SkipViewport, IK_Enter, IST_Release, 0.f );
+		SkipRelease = -1.0;
+	}
+	if( Skips && *Skips && SkipRelease < 0.0 )
+	{
+		char* End = NULL;
+		const double When = strtod( Skips, &End );
+		if( End == Skips )
+			Skips = NULL;
+		else if( Elapsed >= When )
+		{
+			if( SkipViewport )
+				Engine->InputEvent( SkipViewport, IK_Enter, IST_Press, 0.f );
+			SkipRelease = Elapsed + 0.3;
+			Skips = (*End == ',') ? End + 1 : NULL;
+		}
+	}
+	// HP2_OPEN=<map> with HP2_OPEN_AT=<s>: travel to a map (console "open"),
+	// e.g. to capture the loading screen with HP2_SHOT_LOADING=1.
+	static const char* OpenMap = getenv( "HP2_OPEN" );
+	if( OpenMap && SkipViewport && Elapsed >= (getenv("HP2_OPEN_AT") ? atof(getenv("HP2_OPEN_AT")) : 8.0) )
+	{
+		SkipViewport->Exec( *FString::Printf( TEXT("open %s"), ANSI_TO_TCHAR( OpenMap ) ), *GLog );
+		OpenMap = NULL;
+	}
+	// HP2_EXEC="<s>:<console command>;<s>:<command>..." runs console
+	// commands at those seconds, in order (e.g. "7:SAVEPACTORS;18:SAVEGAME 0").
+	static const char* ExecList = getenv( "HP2_EXEC" );
+	if( ExecList && *ExecList && SkipViewport )
+	{
+		char* End = NULL;
+		const double When = strtod( ExecList, &End );
+		if( End == ExecList || *End != ':' )
+			ExecList = NULL;
+		else if( Elapsed >= When )
+		{
+			const char* CmdStart = End + 1;
+			const char* CmdEnd = strchr( CmdStart, ';' );
+			const std::string Cmd = CmdEnd ? std::string( CmdStart, CmdEnd - CmdStart ) : std::string( CmdStart );
+			debugf( TEXT("HP2_EXEC: %s"), ANSI_TO_TCHAR( Cmd.c_str() ) );
+			SkipViewport->Exec( ANSI_TO_TCHAR( Cmd.c_str() ), *GLog );
+			ExecList = CmdEnd ? CmdEnd + 1 : NULL;
+		}
+	}
+	// HP2_LIST_NEAR=<radius>: once, at HP2_LIST_AT seconds (default 6), log
+	// every visible actor within radius of the player (class, mesh, skin,
+	// texture, style) to identify what is drawn on screen.
+	static const char* ListNear = getenv( "HP2_LIST_NEAR" );
+	if( ListNear && SkipViewport && Elapsed >= (getenv("HP2_LIST_AT") ? atof(getenv("HP2_LIST_AT")) : 6.0) )
+	{
+		const FLOAT Radius = (FLOAT)atof( ListNear );
+		APlayerPawn* P = SkipViewport->Actor;
+		ULevel* L = P ? P->XLevel : NULL;
+		for( INT j=0; L && j<L->Actors.Num(); j++ )
+		{
+			AActor* A = L->Actors(j);
+			if( !A || A->bHidden || (A->Location - P->Location).Size() > Radius )
+				continue;
+			debugf( TEXT("HP2_NEAR: %s class=%s dist=%.0f draw=%i mesh=%s skin=%s tex=%s style=%i unlit=%i ambient=%i scale=%.2f"),
+				A->GetName(), A->GetClass()->GetName(), (A->Location - P->Location).Size(), (INT)A->DrawType,
+				A->Mesh ? A->Mesh->GetPathName() : TEXT("None"), A->Skin ? A->Skin->GetPathName() : TEXT("None"),
+				A->Texture ? A->Texture->GetPathName() : TEXT("None"), (INT)A->Style, (INT)A->bUnlit, (INT)A->AmbientGlow, A->DrawScale );
+		}
+		ListNear = NULL;
+		// HP2_LIST_SURF=<actor name>: BSP surfaces within 200 units of it.
+		if( const char* SurfNear = getenv( "HP2_LIST_SURF" ) )
+		{
+			AActor* Ref = NULL;
+			for( INT j=0; L && j<L->Actors.Num() && !Ref; j++ )
+				if( L->Actors(j) && !appStricmp( L->Actors(j)->GetName(), ANSI_TO_TCHAR( SurfNear ) ) )
+					Ref = L->Actors(j);
+			UModel* M = L ? L->Model : NULL;
+			for( INT n=0; Ref && M && n<M->Nodes.Num(); n++ )
+			{
+				const FBspNode& Node = M->Nodes(n);
+				FVector Center(0,0,0);
+				for( INT v=0; v<Node.NumVertices; v++ )
+					Center += M->Points( M->Verts( Node.iVertPool + v ).pVertex );
+				if( Node.NumVertices )
+					Center /= (FLOAT)Node.NumVertices;
+				if( (Center - Ref->Location).Size() > 200.f )
+					continue;
+				const FBspSurf& Surf = M->Surfs( Node.iSurf );
+				debugf( TEXT("HP2_SURF: node %i surf %i tex=%s flags=0x%08x lightmap=%i normal=(%.2f,%.2f,%.2f) dz=%.0f"),
+					n, Node.iSurf, Surf.Texture ? Surf.Texture->GetPathName() : TEXT("None"), Surf.PolyFlags,
+					Surf.iLightMap, M->Vectors(Surf.vNormal).X, M->Vectors(Surf.vNormal).Y, M->Vectors(Surf.vNormal).Z, Center.Z - Ref->Location.Z );
+			}
+		}
+	}
+	// HP2_PAUSE_AT=<s>: hold Escape (the Switch Plus button: pause menu).
+	static const char* PauseAt = getenv( "HP2_PAUSE_AT" );
+	static double PauseRelease = -1.0;
+	if( PauseRelease >= 0.0 && Elapsed >= PauseRelease )
+	{
+		if( SkipViewport )
+			Engine->InputEvent( SkipViewport, IK_Escape, IST_Release, 0.f );
+		PauseRelease = -1.0;
+	}
+	if( PauseAt && Elapsed >= atof( PauseAt ) )
+	{
+		if( SkipViewport )
+			Engine->InputEvent( SkipViewport, IK_Escape, IST_Press, 0.f );
+		PauseRelease = Elapsed + 0.3;
+		PauseAt = NULL;
+	}
+	static const char* GotoClass = getenv( "HP2_GOTO" );
+	if( GotoClass && Elapsed >= (getenv("HP2_GOTO_AT") ? atof(getenv("HP2_GOTO_AT")) : 6.0) )
+	{
+		ULevel* Level = (Engine && Engine->Client && Engine->Client->Viewports.Num()) ? Engine->Client->Viewports(0)->Actor->XLevel : NULL;
+		APlayerPawn* Player = (Engine && Engine->Client && Engine->Client->Viewports.Num()) ? Engine->Client->Viewports(0)->Actor : NULL;
+		const FString Wanted = FString( ANSI_TO_TCHAR( GotoClass ) ).Caps();
+		for( INT i=0; Level && Player && i<Level->Actors.Num(); i++ )
+		{
+			AActor* Target = Level->Actors(i);
+			if( !Target || Target == Player || FString( Target->GetClass()->GetName() ).Caps().InStr( *Wanted ) == INDEX_NONE )
+				continue;
+			const FVector Dest = Target->Location + FVector( getenv("HP2_GOTO_DX") ? (FLOAT)atof(getenv("HP2_GOTO_DX")) : -160.f, getenv("HP2_GOTO_DY") ? (FLOAT)atof(getenv("HP2_GOTO_DY")) : 0.f, getenv("HP2_GOTO_DZ") ? (FLOAT)atof(getenv("HP2_GOTO_DZ")) : 40.f );
+			Level->FarMoveActor( Player, Dest, 0, 1 );
+			// Face the target so the follow camera looks at it.
+			FRotator Facing = (Target->Location - Dest).Rotation();
+			Facing.Pitch = 0;
+			Player->Rotation = Facing;
+			Player->ViewRotation = FRotator( -3000, Facing.Yaw, 0 );
+			debugf( TEXT("HP2_GOTO: moved %s next to %s"), Player->GetName(), Target->GetFullName() );
+			// Describe what is drawn around the target (decals, lights).
+			for( INT j=0; j<Level->Actors.Num(); j++ )
+			{
+				AActor* A = Level->Actors(j);
+				if( !A || (A->Location - Target->Location).Size() > 400.f )
+					continue;
+				if( A->IsA( ADecal::StaticClass() ) || A->LightType != LT_None )
+					debugf( TEXT("HP2_GOTO: near %s class=%s style=%i tex=%s drawscale=%f light=%i bright=%i hue=%i sat=%i radius=%i dyn=%i dark=%i owner=%s"),
+						A->GetName(), A->GetClass()->GetName(), A->Style,
+						A->Texture ? A->Texture->GetPathName() : TEXT("None"), A->DrawScale,
+						A->LightType, A->LightBrightness, A->LightHue, A->LightSaturation, A->LightRadius,
+						A->bDynamicLight, (INT)A->bDarkLight, A->Owner ? A->Owner->GetName() : TEXT("None") );
+			}
+			if( getenv( "HP2_GOTO_PITCH" ) )
+				Player->ViewRotation.Pitch = atoi( getenv( "HP2_GOTO_PITCH" ) );
+			break;
+		}
+		// HP2_NODARK=1: switch dark lights off to isolate their effect.
+		if( getenv( "HP2_NODARK" ) && Level )
+		{
+			INT Count = 0;
+			for( INT j=0; j<Level->Actors.Num(); j++ )
+				if( Level->Actors(j) && Level->Actors(j)->bDarkLight )
+				{
+					Level->Actors(j)->LightType = LT_None;
+					++Count;
+				}
+			GCache.Flush();
+			debugf( TEXT("HP2_NODARK: disabled %i dark lights"), Count );
+		}
+		GotoClass = NULL;
+	}
+	if( Shots && *Shots )
+	{
+		char* End = NULL;
+		const double When = strtod( Shots, &End );
+		if( End == Shots )
+			Shots = NULL;
+		else if( Elapsed >= When )
+		{
+			UClient* Client = Engine ? Engine->Client : NULL;
+			if( Client && Client->Viewports.Num() )
+			{
+				APlayerPawn* P = Client->Viewports(0)->Actor;
+				if( P && P->Level )
+					debugf( TEXT("HP2_AUTOSHOT: bShowMenu=%i bShowLoadingScreen=%i Pauser='%s' LevelAction=%i"),
+						(INT)P->bShowMenu, (INT)P->bShowLoadingScreen, *P->Level->Pauser, (INT)P->Level->LevelAction );
+				Client->Viewports(0)->Exec( TEXT("SHOT"), *GLog );
+			}
+			Shots = (*End == ',') ? End + 1 : NULL;
+		}
+	}
+	if( Quit && Elapsed >= atof( Quit ) )
+	{
+		Quit = NULL;
+		appRequestExit( 0 );
+	}
+}
+
 static void MainLoopTick( FMainLoopState& S )
 {
+	AutoShotTick( S.Engine );
 	if( GShadowAdmissionTraceReporter )
 		GShadowAdmissionTraceReporter->SetFrame( S.TraceTickIndex );
 	if( GCreatureGeneratorTraceReporter )
@@ -5702,6 +6033,19 @@ static void MainLoopTick( FMainLoopState& S )
 		S.LifecycleReporter->BeginTick( (INT)S.TraceTickIndex );
 	appSetRandTraceTick( S.TraceTickIndex, "engine_tick" );
 	S.Engine->Tick( DeltaSeconds );
+#if defined(__SWITCH__)
+	// Release the startup logo once the first real level (not the Entry or
+	// Startup menu maps loaded during boot) is up, or after 30 s at most.
+	if( !GSwitchNotifiedRunning )
+	{
+		UGameEngine* Game = Cast<UGameEngine>( S.Engine );
+		const TCHAR* LevelName = (Game && Game->GLevel && Game->GLevel->GetOuter()) ? Game->GLevel->GetOuter()->GetName() : NULL;
+		const UBOOL BootMap = !LevelName || !appStricmp( LevelName, TEXT("Entry") ) || !appStricmp( LevelName, TEXT("Startup") );
+		static const FTime FirstTick = appSeconds();
+		if( !BootMap || appSeconds() - FirstTick > 30.0 )
+			SwitchNotifyRunning();
+	}
+#endif
 	appSetRandTraceTick( S.TraceTickIndex, "after_tick" );
 	if( S.ActorSlotDumpPending && ActorSlotDump::WriteIfReady( S.Engine ) )
 		S.ActorSlotDumpPending = 0;
@@ -5725,7 +6069,13 @@ static void MainLoopFrameCap( const FMainLoopState& S )
 	// Enforce optional maximum tick rate. A fixed-delta replay is driven
 	// by tick count, so it must not inherit the unfocused wall-clock cap.
 	FLOAT TargetTickRate = S.Engine->GetMaxTickRate();
-#if !defined(__SWITCH__)
+#if defined(__SWITCH__)
+	// The Switch presents with VSync at 60 Hz, which already paces the loop.
+	// A software cap at the same 60 Hz sleeps on top of the blocking swap and
+	// can push a frame past the next vblank (intermittent 30 FPS). Keep a cap
+	// only as a safety net above the display rate, for VSync=Off configs.
+	TargetTickRate = 75.f;
+#else
 	if( S.FixedDeltaSeconds <= 0.0f && SDL_GetKeyboardFocus() == NULL )
 		TargetTickRate = TargetTickRate > 0.f ? Min( TargetTickRate, 10.f ) : 10.f;
 #endif
@@ -6659,14 +7009,22 @@ static void SwitchMainThread( void* Arg )
 {
 	FSwitchMainArgs* Args = (FSwitchMainArgs*)Arg;
 	SwitchLog( "[SWITCH THREAD] Entered 16MB Game Thread!\n" );
-#if defined(__SWITCH__)
 	SwitchInitSaveData();
 	SwitchApplyPerformanceProfile();
-#endif
+	{
+		// Diagnostic switch: an empty sdmc:/switch/hp2/no_lazyload file
+		// restores the port's original eager loading of lazy arrays.
+		struct stat St;
+		if( stat( "sdmc:/switch/hp2/no_lazyload", &St ) == 0 )
+		{
+			GLazyLoad = 0;
+			SwitchLog( "[SWITCH] no_lazyload marker found: lazy loading disabled\n" );
+		}
+	}
+	SwitchInstallAppletHooks();
 	Args->Result = RealMain( Args->ArgC, Args->ArgV );
-#if defined(__SWITCH__)
+	SwitchRemoveAppletHooks();
 	SwitchRestorePerformanceProfile();
-#endif
 	SwitchLog( "[SWITCH THREAD] Exiting 16MB Game Thread with result %d.\n", Args->Result );
 }
 
@@ -6815,14 +7173,31 @@ int main( int ArgC, char* ArgV[] )
 						{
 							char CopyBuf[65536];
 							size_t ReadBytes = 0;
+							bool CopyOk = true;
 							while( (ReadBytes = fread(CopyBuf, 1, sizeof(CopyBuf), In)) > 0 )
 							{
-								fwrite(CopyBuf, 1, ReadBytes, Out);
+								if( fwrite(CopyBuf, 1, ReadBytes, Out) != ReadBytes )
+								{
+									CopyOk = false;
+									break;
+								}
 							}
+							if( ferror(In) )
+								CopyOk = false;
 							fclose(In);
-							fclose(Out);
+							if( fclose(Out) != 0 )
+								CopyOk = false;
+							if( !CopyOk )
+							{
+								// Never commit a truncated savegame.
+								unlink( ActiveSave0.c_str() );
+								SwitchLog( "[SWITCH SAVE ERROR] Save migration failed while copying; SD save left untouched.\n" );
+							}
+							else
+							{
+								SwitchLog( "[SWITCH SAVE] Save migration complete!\n" );
+							}
 							SwitchCommitSaveData();
-							SwitchLog( "[SWITCH SAVE] Save migration complete!\n" );
 						}
 						else
 						{
@@ -6838,6 +7213,42 @@ int main( int ArgC, char* ArgV[] )
 
 		struct stat StFinal;
 		bool HasValidSave0 = (stat( ActiveSave0.c_str(), &StFinal ) == 0 && StFinal.st_size > 1024);
+
+		// Boot-loop guard: a savegame that crashes the engine while loading
+		// would be auto-loaded again on every boot. Count auto-load attempts
+		// in a marker cleared once a load succeeds; after two attempts that
+		// never finished, set the save aside (kept for repair) and start
+		// without it. One unfinished attempt is tolerated, since the user
+		// may simply close the software during loading.
+		const std::string AutoLoadMarker = ActiveUserDir + "Save/autoload.pending";
+		int AutoLoadAttempts = 0;
+		if( FILE* MarkerIn = fopen( AutoLoadMarker.c_str(), "rb" ) )
+		{
+			if( fscanf( MarkerIn, "%d", &AutoLoadAttempts ) != 1 )
+				AutoLoadAttempts = 0;
+			fclose( MarkerIn );
+		}
+		if( HasValidSave0 && AutoLoadAttempts >= 2 )
+		{
+			const std::string Failed = ActiveSave0 + ".failed";
+			unlink( Failed.c_str() );
+			const int RenameRc = rename( ActiveSave0.c_str(), Failed.c_str() );
+			unlink( AutoLoadMarker.c_str() );
+			SwitchCommitSaveDataForPath( ActiveSave0.c_str() );
+			SwitchLog( "[SWITCH SAVE ERROR] Save0 failed to load %d times; moved to '%s' (rc=%d). Starting without it.\n",
+				AutoLoadAttempts, Failed.c_str(), RenameRc );
+			HasValidSave0 = (RenameRc != 0);
+		}
+		if( HasValidSave0 )
+		{
+			if( FILE* MarkerOut = fopen( AutoLoadMarker.c_str(), "wb" ) )
+			{
+				fprintf( MarkerOut, "%d\n", AutoLoadAttempts + 1 );
+				fclose( MarkerOut );
+				SwitchCommitSaveDataForPath( AutoLoadMarker.c_str() );
+				SwitchSetAutoLoadMarker( AutoLoadMarker.c_str() );
+			}
+		}
 
 		std::string LaunchPrefix;
 		if( HasValidSave0 )

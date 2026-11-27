@@ -2585,6 +2585,79 @@ inline INT Compare( UObject* A, UObject* B )
 }
 
 //
+// Keyed form of the same ordering. Compare(UObject*,UObject*) above reads
+// each object's linker and export-map entry on every comparison; on the
+// Switch's CPU those scattered reads dominated the sort, which EndLoad runs
+// again each time loading appends objects. Reading the keys once per object
+// and sorting them with the same Sort and the same decisions yields the same
+// order (idea from the Rust port's keyed load sort).
+//
+struct FLoadSortKey
+{
+	UObject* Obj;
+	ULinkerLoad* Linker;
+	INT Offset;
+};
+static ULinkerLoad* CurLinker;
+static INT CurOffset;
+inline INT Compare( const FLoadSortKey& A, const FLoadSortKey& B )
+{
+	if( A.Linker != B.Linker )
+	{
+		if( A.Linker == CurLinker )
+			return -1;
+		if( B.Linker == CurLinker )
+			return 1;
+		return A.Linker > B.Linker ? 1 : -1;
+	}
+	if( A.Linker == CurLinker )
+	{
+		if( A.Offset > CurOffset && B.Offset < CurOffset )
+			return -1;
+		if( A.Offset < CurOffset && B.Offset > CurOffset )
+			return 1;
+	}
+	return A.Offset - B.Offset;
+}
+static void SortLoadedObjects( UObject** First, INT Num )
+{
+	static TArray<FLoadSortKey> Keys;
+	Keys.Empty( Num );
+	Keys.Add( Num );
+	for( INT k=0; k<Num; k++ )
+	{
+		UObject* O = First[k];
+		ULinkerLoad* L = O->GetLinker();
+		Keys(k).Obj = O;
+		Keys(k).Linker = L;
+		Keys(k).Offset = L->ExportMap( O->GetLinkerIndex() ).SerialOffset;
+	}
+	CurLinker = CurObj->GetLinker();
+	CurOffset = CurLinker->ExportMap( CurObj->GetLinkerIndex() ).SerialOffset;
+	// Equivalence check (local test): sort a copy the original way.
+	static const UBOOL Check = getenv( "HP2_SORT_CHECK" ) != NULL;
+	TArray<UObject*> Reference;
+	if( Check )
+	{
+		Reference.Add( Num );
+		for( INT k=0; k<Num; k++ )
+			Reference(k) = First[k];
+		Sort( &Reference(0), Num );
+	}
+	Sort( &Keys(0), Num );
+	for( INT k=0; k<Num; k++ )
+		First[k] = Keys(k).Obj;
+	if( Check )
+	{
+		static INT Sorts = 0, Mismatches = 0;
+		++Sorts;
+		for( INT k=0; k<Num; k++ )
+			if( Reference(k) != First[k] ) { ++Mismatches; break; }
+		debugf( TEXT("HP2_SORT_CHECK: sort %i of %i objects, mismatching sorts so far: %i"), Sorts, Num, Mismatches );
+	}
+}
+
+//
 // End loading packages.
 //
 void UObject::EndLoad()
@@ -2606,7 +2679,7 @@ void UObject::EndLoad()
 				if( CurObj && GObjLoaded.Num() > LastSorted && i < GObjLoaded.Num()-1 )
 				{
 					// Sort new objects by archive/address.
-					Sort( &GObjLoaded(i), GObjLoaded.Num() - i );
+					SortLoadedObjects( &GObjLoaded(i), GObjLoaded.Num() - i );
 					LastSorted = GObjLoaded.Num();
 				}
 
@@ -3236,11 +3309,16 @@ UBOOL UObject::SavePackage( UObject* InOuter, UObject* Base, DWORD TopLevelFlags
 		if( !GFileManager->Move( Filename, TempFilename ) )
 		{
 #if defined(__SWITCH__)
-			SwitchLog( "[SWITCH SAVE] Move failed, attempting Delete and second Move/Copy fallback...\n" );
-#endif
+			// The Switch Move already falls back to a stream copy and
+			// restores the previous file on failure; deleting it here would
+			// throw away the last good savegame.
+			SwitchLog( "[SWITCH SAVE] Move failed; previous save kept.\n" );
+			if( 0 )
+#else
 			GFileManager->Delete( Filename, 0, 1 );
 			if( GFileManager->Move( Filename, TempFilename ) ||
 			    (GFileManager->Copy( Filename, TempFilename, 1, 1, 0, NULL ) && GFileManager->Delete( TempFilename, 1, 1 )) )
+#endif
 			{
 				debugf( NAME_Log, TEXT("Moved '%s' to '%s' via fallback"), TempFilename, Filename );
 #if defined(__SWITCH__)

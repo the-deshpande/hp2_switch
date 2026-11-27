@@ -15,7 +15,7 @@ import sys
 DEFAULT_TITLE_ID = "0100485032000000"
 TITLE_NAME = "Harry Potter and the Chamber of Secrets"
 PUBLISHER_NAME = "EA Games"
-APP_VERSION = "1.2.0"
+APP_VERSION = "1.3.0"
 
 REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 PACKAGING_DIR = os.path.join(REPO_ROOT, "packaging", "nsp")
@@ -34,8 +34,6 @@ def find_hacbrewpack(custom_path=None):
         os.path.join(REPO_ROOT, "tools", "hacbrewpack.exe"),
         os.path.join(REPO_ROOT, "tools", "hacbrewpack"),
         os.path.join(REPO_ROOT, "hacbrewpack.exe"),
-        r"D:\ROMS\Carafe\hacbrewpack.exe",
-        r"C:\tools\hacbrewpack.exe",
     ]
     for c in candidates:
         if os.path.isfile(c):
@@ -76,6 +74,31 @@ def ensure_elf2nso(out_dir):
     return None
 
 
+# A whole savegame is written before the save partition is committed, so the
+# journal must hold one (saves of this engine family reach ~9 MB). Keep in
+# sync with GSwitchSaveDataSize / GSwitchSaveJournalSize in SDLLaunch.cpp.
+SAVE_DATA_SIZE = 64 * 1024 * 1024
+SAVE_JOURNAL_SIZE = 16 * 1024 * 1024
+
+
+def patch_nacp_save_layout(nacp_path, title_id):
+    with open(nacp_path, "r+b") as f:
+        f.seek(0x3060)
+        f.write(APP_VERSION.encode("ascii").ljust(0x10, b"\x00"))  # display_version
+        f.seek(0x3025)
+        f.write(b"\x01")  # startup_user_account = 1 (required)
+        f.seek(0x3078)
+        f.write(struct.pack("<Q", int(title_id, 16)))  # save_data_owner_id
+        f.seek(0x3080)
+        f.write(struct.pack("<Q", SAVE_DATA_SIZE))     # user_account_save_data_size
+        f.seek(0x3088)
+        f.write(struct.pack("<Q", SAVE_JOURNAL_SIZE))  # user_account_save_data_journal_size
+        f.seek(0x3148)
+        f.write(struct.pack("<Q", SAVE_DATA_SIZE))     # user_account_save_data_size_max
+        f.seek(0x3150)
+        f.write(struct.pack("<Q", SAVE_JOURNAL_SIZE))  # user_account_save_data_journal_size_max
+
+
 def ensure_packaging_assets(title_id):
     """Ensure control.nacp, main.npdm, and icon exist in packaging/nsp/."""
     exefs_dir = os.path.join(PACKAGING_DIR, "exefs")
@@ -113,17 +136,10 @@ def ensure_packaging_assets(title_id):
             ]
             subprocess.check_call(cmd)
 
-        if os.path.isfile(nacp_dst):
-            # Patch required user account and 32MB save allocation
-            with open(nacp_dst, "r+b") as f:
-                f.seek(0x3025)
-                f.write(b"\x01")  # startup_user_account = 1 (required)
-                f.seek(0x3078)
-                f.write(struct.pack("<Q", int(title_id, 16)))  # save_data_owner_id
-                f.seek(0x3080)
-                f.write(struct.pack("<Q", 0x2000000))  # 32 MB save size
-                f.seek(0x3088)
-                f.write(struct.pack("<Q", 0x200000))   # 2 MB journal size
+    # Always (re)apply the save layout, also to a control.nacp that already
+    # exists, so older packaging dirs pick up the current sizes.
+    if os.path.isfile(nacp_dst):
+        patch_nacp_save_layout(nacp_dst, title_id)
 
     # 3. NPDM
     npdm_dst = os.path.join(exefs_dir, "main.npdm")
@@ -292,7 +308,7 @@ def main():
 
     # Rename output NSP to friendly title
     raw_nsp = os.path.join(out_dir, f"{args.titleid}.nsp")
-    pretty_nsp = os.path.join(out_dir, f"Harry Potter and the Chamber of Secrets [{args.titleid}][v0].nsp")
+    pretty_nsp = os.path.join(out_dir, f"Harry Potter and the Chamber of Secrets [{args.titleid}][v0] ({APP_VERSION}).nsp")
     if os.path.isfile(raw_nsp):
         if os.path.isfile(pretty_nsp):
             os.remove(pretty_nsp)

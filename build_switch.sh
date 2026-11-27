@@ -1,12 +1,20 @@
 #!/bin/bash
 # Build HarryPotter2.nro for Nintendo Switch.
-# If /opt/devkitpro is not installed locally, runs itself inside the official
-# devkitpro/devkita64 Docker image.
+# If /opt/devkitpro is not installed locally, runs itself inside the
+# hp2-devkita64 Docker image: devkitpro/devkita64 plus a Switch Mesa rebuilt
+# with GL program binaries enabled (packaging/switch-mesa), which lets the
+# game reload its compiled shaders instead of recompiling them every boot.
+# The image is built on first use.
 set -e
 
 if [ ! -d "/opt/devkitpro" ]; then
-    echo "Running build inside devkitpro/devkita64 container..."
-    docker run --rm -v "$PWD:/work" -w /work devkitpro/devkita64:latest ./build_switch.sh "$@"
+    IMAGE=hp2-devkita64
+    if ! docker image inspect "$IMAGE" >/dev/null 2>&1; then
+        echo "Building $IMAGE (devkitA64 + patched Switch Mesa, one-time)..."
+        docker build -t "$IMAGE" packaging/switch-mesa
+    fi
+    echo "Running build inside $IMAGE container..."
+    docker run --rm -v "$PWD:/work" -w /work "$IMAGE" ./build_switch.sh "$@"
     exit $?
 fi
 

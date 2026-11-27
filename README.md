@@ -24,7 +24,10 @@ The port supports two completely independent execution formats:
   - Automatically loads your latest save (`Slot0/Save0.usa`) on startup if one exists; otherwise starts a fresh game at Privet Drive.
   - **Quick Load Combo**: Press **L + R + Plus + Minus** at any time during gameplay to immediately reload your latest save without needing to go to the main menu.
   - **Dual Save Storage & Migration**: Automatically detects environment—uses internal NAND user account storage (`save:/`) in NSP mode, and SD card (`sdmc:/switch/hp2/User/Save`) in NRO mode. On first boot of the NSP, any existing save file found on the SD card is automatically migrated to internal NAND!
-  - **Clean SD Footprint**: In NSP mode, Mesa shader caches are stored internally in NAND (`save:/User/Cache/mesa`), file logs are disabled, and no `hp2` folder is created on the SD card.
+  - **Save Partition Reserved for Saves**: In NSP mode the internal save (64 MB, 16 MB journal) only holds savegames and settings. Saves created by older builds are enlarged automatically on first boot. Commits happen only when a file on `save:/` is complete, and a failed save never replaces the previous one.
+  - **SD Card Usage**: The Mesa shader cache lives in `sdmc:/switch/hp2/cache/mesa` (max 64 MB). Crash dumps go to `sdmc:/switch/hp2/crash.log`. In NSP mode no log file is written unless you create an empty file `sdmc:/switch/hp2/debug_log`; the log then goes to `sdmc:/switch/hp2/boot.log`. The NRO always writes `boot.log` (buffered).
+- **Docked / Handheld Switching**: The output follows the console mode live (1080p docked, 720p handheld). Set `SwitchDockedFullHD=False` under `[SDLDrv.SDLClient]` in `System.ini` to stay at 720p when docked.
+- **Sleep & HOME Menu**: Settings and save data are committed when the game loses focus, and the CPU/GPU boost is re-applied after waking from sleep. Original clocks are restored on exit.
 - **Full Controller Integration**: Native Joy-Con and Pro Controller mapping with analog sticks, face buttons, triggers, and jump/spell actions.
 
 ---
@@ -39,7 +42,8 @@ The port supports two completely independent execution formats:
 | **B** | Jump / Cancel |
 | **X** | Sneak / Action |
 | **Y** | First Person Look |
-| **ZL / ZR** | Target Lock / Spell Action |
+| **ZR** | Cast Spell / Use Wand (same as A) |
+| **ZL** | Jump (same as B) |
 | **Plus (`+`)** | Pause / Spell Book Menu |
 | **Minus (`-`)** | Folio Magi (Card Album) / Map |
 | **L + R + Plus + Minus** | **Quick Load** latest save |

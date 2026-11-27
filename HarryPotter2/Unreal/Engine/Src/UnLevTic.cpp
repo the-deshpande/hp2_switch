@@ -1173,6 +1173,15 @@ void ULevel::Tick( ELevelTick TickType, FLOAT DeltaSeconds )
 			APlayerPawn* PlayerPawn=Cast<APlayerPawn>(Actors(iActor));
 			if( PlayerPawn && PlayerPawn->Player )
 			{
+				// Clear the mouse-smoothing history while paused: cursor motion
+				// in the pause menu (the Switch stick feeds mouse axes there)
+				// otherwise accumulated and turned the camera on resume. Done
+				// before the script callbacks, which can unpause or destroy the
+				// pawn. Same fix as the Rust port (lev_tic level_tick_body).
+				PlayerPawn->SmoothMouseX = 0.f;
+				PlayerPawn->SmoothMouseY = 0.f;
+				PlayerPawn->BorrowedMouseX = 0.f;
+				PlayerPawn->BorrowedMouseY = 0.f;
 				PlayerPawn->Player->ReadInput( DeltaSeconds );
 				PlayerPawn->eventPlayerInput( DeltaSeconds );
 				for( TFieldIterator<UFloatProperty> It(PlayerPawn->GetClass()); It; ++It )

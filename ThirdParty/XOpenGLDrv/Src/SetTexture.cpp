@@ -245,9 +245,13 @@ UBOOL UXOpenGLRenderDevice::UploadTexture(FTextureInfo& Info, FCachedTexture* Bi
 			break;
 
 		case TEXF_RGBA7:
+			// Light and fog maps are stored BGRA. The complex shader only
+			// swizzles (.bgr) on GLES, which cannot upload BGRA; on desktop
+			// GL they must be uploaded as BGRA, or red and blue swap across
+			// all static lighting (blue night light rendered red-orange).
 			MinComposeSize = Info.Mips[Bind->BaseMip]->USize * Info.Mips[Bind->BaseMip]->VSize * 4;
 			InternalFormat = GL_RGBA8;
-			SourceFormat = GL_RGBA;
+			SourceFormat = (OpenGLVersion == GL_ES) ? GL_RGBA : GL_BGRA;
 			break;
 
 		case TEXF_RGB16:

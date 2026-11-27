@@ -720,6 +720,13 @@ bool ULevel::LoadPersistentActors( const FString& MapName )
 				  TEXT("_pa.") + URL.DefaultSaveExt;
 	//****************************************************************
 	
+#if 1 // Copy-on-write PA cache, all platforms.
+	// Copy-on-write PA cache (see LoadPersistentActorCache): a level not
+	// changed since the last save has no cached file; read the slot one.
+	if( GFileManager->FileSize( *PAFilename ) <= 0 )
+		PAFilename = GSys->SaveSlotPath * FinalMapName.Left( FinalMapName.InStr(URL.DefaultMapExt)-1 ) +
+					 TEXT("_pa.") + URL.DefaultSaveExt;
+#endif
 	do
 	{
 		// Open our actors file (if we have one)

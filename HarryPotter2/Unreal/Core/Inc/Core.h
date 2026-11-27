@@ -571,6 +571,12 @@ CORE_API extern UBOOL					GIsServer;
 #if defined(__SWITCH__)
 extern "C" CORE_API void SwitchLog( const char* Fmt, ... );
 extern "C" CORE_API void SwitchCommitSaveData( void );
+extern "C" CORE_API void SwitchCommitSaveDataForPath( const char* Path );
+extern "C" CORE_API void SwitchNativeResolution( INT* Width, INT* Height );
+extern "C" CORE_API void SwitchAutoLoadSucceeded( void );
+// Group the save-data commits of a multi-file operation into one commit.
+extern "C" CORE_API void SwitchBeginCommitBatch( void );
+extern "C" CORE_API void SwitchEndCommitBatch( void );
 #endif
 CORE_API extern UBOOL					GIsCriticalError;
 CORE_API extern UBOOL					GIsStarted;

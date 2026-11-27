@@ -29,6 +29,9 @@ IMPLEMENT_CLASS(UGameEngine);
 	cleanup!!
 -----------------------------------------------------------------------------*/
 
+// Set while LoadMap draws the loading screen (see UGameEngine::Draw).
+static UBOOL GDrawingLoadingScreen = 0;
+
 void UGameEngine::PaintProgress()
 {
 	guard(PaintProgress);
@@ -880,6 +883,7 @@ UBOOL UGameEngine::Browse( FURL URL, const TMap<FString,FString>* TravelInfo, FS
 		{
 #if defined(__SWITCH__)
 			SwitchLog( "[SWITCH LOAD] LoadMap succeeded for '%ls'!\n", *Temp );
+			SwitchAutoLoadSucceeded();
 #endif
 			// Copy the hub stack.
 			INT i;
@@ -999,6 +1003,35 @@ void UGameEngine::FixUpLevel( )
 	debugf(TEXT("Level is %s"), GLevel->GetFullName());
 
 }
+
+//
+// Fraction of Console.FadeoutTime used for the fade-out drawn before a level
+// is replaced. The stock fade (~0.5 s of wall time) is cut to 25%, which
+// roughly halves saved-game load time (idea from the upstream project's
+// "Faster level loads" change). HP2_LOAD_FADE_SCALE=1 restores the original;
+// any value in (0, 10] is accepted.
+//
+#if defined(__SWITCH__)
+extern "C" long long GSwitchReadNs, GSwitchReadBytes, GSwitchReadCalls, GSwitchReadCacheBytes;
+#endif
+
+static FLOAT LoadFadeScale()
+{
+	static FLOAT Scale = -1.f;
+	if( Scale < 0.f )
+	{
+		Scale = 0.25f;
+		if( const char* Env = getenv("HP2_LOAD_FADE_SCALE") )
+		{
+			char* End = NULL;
+			const double Value = strtod( Env, &End );
+			if( End != Env && Value > 0.0 && Value <= 10.0 )
+				Scale = (FLOAT)Value;
+		}
+	}
+	return Scale;
+}
+
 //
 // Load a map.
 //
@@ -1038,13 +1071,19 @@ ULevel* UGameEngine::LoadMap( const FURL& URL, UPendingLevel* Pending, const TMa
 			{
 				Draw( Viewport );
 				FTime Cur = appSeconds();
-				Viewport->Actor->FlashFog.W -= (Cur-Prev) / Viewport->Console->FadeoutTime;
+				Viewport->Actor->FlashFog.W -= (Cur-Prev) / (Viewport->Console->FadeoutTime * LoadFadeScale());
 				Prev = Cur;
 			}
 		}
 
 		Viewport->Actor->FlashFog.W = 0.f;
+		GDrawingLoadingScreen = 1;
 		Draw( Viewport );
+		GDrawingLoadingScreen = 0;
+		// Local test helper (see AutoShotTick in SDLLaunch.cpp): capture the
+		// loading screen as drawn.
+		if( getenv( "HP2_SHOT_LOADING" ) )
+			Viewport->Exec( TEXT("SHOT"), *GLog );
 
 		if( Audio )
 			Audio->SetViewport( Audio->GetViewport() );
@@ -1650,6 +1689,14 @@ ULevel* UGameEngine::LoadMap( const FURL& URL, UPendingLevel* Pending, const TMa
 	
 	debugf( TEXT("Load time %s: %f seconds total, %f app"), 
 		*URL.Map, appSeconds()-LoadTime[0], appProcessSeconds()-LoadTime[1] );
+#if defined(__SWITCH__)
+	{
+		// Cumulative file reads since boot (debug log only): splits load time
+		// between I/O and CPU.
+		SwitchLog( "[READ TOTAL] after %ls: %lld bytes in %lld reads, %.1f ms of I/O, %lld MB cached\n",
+			*URL.Map, GSwitchReadBytes, GSwitchReadCalls, GSwitchReadNs / 1e6, GSwitchReadCacheBytes >> 20 );
+	}
+#endif
 
 #if defined(__SWITCH__)
 	// Precache spell sounds and dialog incantations to eliminate spellcast hitching
@@ -1674,9 +1721,23 @@ ULevel* UGameEngine::LoadMap( const FURL& URL, UPendingLevel* Pending, const TMa
 		TEXT("HPSounds.Magic_sfx.cast_Expelliarmus"),
 		TEXT("HPSounds.magic_sfx.spell_hit")
 	};
-	for( INT s=0; s<ARRAY_COUNT(SpellSounds); s++ )
+	// Root them once: otherwise the garbage collection of the next LoadMap
+	// purges them and unloads AllDialog (94 MB), which is then reopened
+	// after every level change.
+	static UBOOL SpellSoundsRooted = 0;
+	if( !SpellSoundsRooted )
 	{
-		UObject::StaticLoadObject( USound::StaticClass(), NULL, SpellSounds[s], NULL, LOAD_NoWarn | LOAD_Quiet, NULL );
+		INT Rooted = 0;
+		for( INT s=0; s<ARRAY_COUNT(SpellSounds); s++ )
+		{
+			UObject* Sound = UObject::StaticLoadObject( USound::StaticClass(), NULL, SpellSounds[s], NULL, LOAD_NoWarn | LOAD_Quiet, NULL );
+			if( Sound )
+			{
+				Sound->AddToRoot();
+				++Rooted;
+			}
+		}
+		SpellSoundsRooted = Rooted > 0;
 	}
 #endif
 
@@ -1856,6 +1917,36 @@ void UGameEngine::Draw( UViewport* Viewport, UBOOL Blit, BYTE* HitData, INT* Hit
 			const FLOAT UIHeight = Min(SavedClipY,480.f*Scale);
 			const FLOAT OffsetX = Max(0.f,(SavedClipX-UIWidth)*0.5f);
 			const FLOAT OffsetY = Max(0.f,(SavedClipY-UIHeight)*0.5f);
+			// The pause/menu and loading screens are 4:3 pages centred in the
+			// UI area; on a widescreen display the frozen world showed through
+			// on both sides. Black out what lies outside the UI area while one
+			// of those screens is up (gameplay HUD keeps the world visible).
+			{
+				APlayerPawn* ViewActor = Viewport->Actor;
+				ALevelInfo* Info = (ViewActor && ViewActor->Level) ? ViewActor->Level : NULL;
+				// bShowLoadingScreen is not usable here: it stays set during
+				// play in some levels. GDrawingLoadingScreen marks the frame
+				// LoadMap draws as the loading screen.
+				const UBOOL FullScreenPage = ViewActor && ( ViewActor->bShowMenu || GDrawingLoadingScreen
+					|| (Info && (Info->Pauser != TEXT("") || Info->LevelAction != LEVACT_None)) );
+				UTexture* Fill = Info ? Info->DefaultTexture : NULL;
+				if( FullScreenPage && Fill && (OffsetX > 0.f || OffsetY > 0.f) )
+				{
+					const FPlane Black( 0.f, 0.f, 0.f, 1.f );
+					const FPlane NoFog( 0.f, 0.f, 0.f, 0.f );
+					const FLOAT X0 = Canvas->OrgX, Y0 = Canvas->OrgY;
+					if( OffsetX > 0.f )
+					{
+						Canvas->DrawTile( Fill, X0, Y0, OffsetX, SavedClipY, 0, 0, 1, 1, NULL, 1.f, Black, NoFog, PF_TwoSided );
+						Canvas->DrawTile( Fill, X0 + OffsetX + UIWidth, Y0, SavedClipX - OffsetX - UIWidth, SavedClipY, 0, 0, 1, 1, NULL, 1.f, Black, NoFog, PF_TwoSided );
+					}
+					if( OffsetY > 0.f )
+					{
+						Canvas->DrawTile( Fill, X0, Y0, SavedClipX, OffsetY, 0, 0, 1, 1, NULL, 1.f, Black, NoFog, PF_TwoSided );
+						Canvas->DrawTile( Fill, X0, Y0 + OffsetY + UIHeight, SavedClipX, SavedClipY - OffsetY - UIHeight, 0, 0, 1, 1, NULL, 1.f, Black, NoFog, PF_TwoSided );
+					}
+				}
+			}
 			Canvas->OrgX += OffsetX;
 			Canvas->OrgY += OffsetY;
 			Canvas->ClipX = UIWidth;

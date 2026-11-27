@@ -1031,6 +1031,28 @@ void FLightManager::Merge( FTextureInfo& Tex, BYTE Effect, INT Key, FLightInfo* 
 		);
 	#else
 
+		if( Info->Actor->bDarkLight )
+		{
+			// Dark lights subtract their color. Only the Windows x86 Merge
+			// handled them: this portable path added them like any light,
+			// so the dark spots level designers put under chests and in
+			// corners rendered as bright white patches. Per channel, clamped
+			// at zero (no borrow between packed channels); alpha untouched.
+			for( INT j=Info->MinU; j<Info->MaxU; j++ )
+			{
+				const DWORD S = Stream[j];
+				const DWORD P = GET_COLOR_DWORD(Palette[NewSrc[j]]);
+				DWORD Result = S & 0xff000000;
+				for( INT Shift=0; Shift<24; Shift+=8 )
+				{
+					const INT Value = (INT)((S >> Shift) & 0xff) - (INT)((P >> Shift) & 0xff);
+					if( Value > 0 )
+						Result |= (DWORD)Value << Shift;
+				}
+				Dest[j] = Result;
+			}
+		}
+		else
 		for( INT j=Info->MinU; j<Info->MaxU; j++ )
 		{
 			Dest[j] = Stream[j] + GET_COLOR_DWORD(Palette[NewSrc[j]]);

@@ -82,25 +82,25 @@ namespace
 		};
 		static const std::uint64_t PredictorHashes[16] =
 		{
-			UINT64_C(0x7f086d5002bdf948), UINT64_C(0xd8d3c849828726ca),
-			UINT64_C(0x44caadc237c42569), UINT64_C(0x07719969bc72deb6),
-			UINT64_C(0x33412b7a85265256), UINT64_C(0xdbb9f34f5d61684e),
-			UINT64_C(0xcd0310db60fa2859), UINT64_C(0x96614d0076b8b1df),
-			UINT64_C(0x1c8ae9c9f9064824), UINT64_C(0x5c177f54e17e425a),
-			UINT64_C(0x4a615f9582bbd96b), UINT64_C(0x282fdf3f5283d59c),
-			UINT64_C(0x7cb382dc3889fdc0), UINT64_C(0x42c69abc34c5eeb0),
-			UINT64_C(0x06e642862df01578), UINT64_C(0x0bcdde5883df3328)
+			UINT64_C(0xb4392c847559eab0), UINT64_C(0x27d174c5d0cd76d0),
+			UINT64_C(0x9f6b6aac0796d3e6), UINT64_C(0x78916a6e17798aa4),
+			UINT64_C(0x86100dfdccfb3a28), UINT64_C(0x150899a47ddfe728),
+			UINT64_C(0xae14d36298cc0ba5), UINT64_C(0x8b2595a9b3e41ef9),
+			UINT64_C(0xceb21f4904b0ef78), UINT64_C(0xc535358d45619a65),
+			UINT64_C(0x567f18e48835d33d), UINT64_C(0x6f2cf35063e19f74),
+			UINT64_C(0x1d8365fb741413a1), UINT64_C(0x6f55951bb0a0a045),
+			UINT64_C(0x97b9be811da18410), UINT64_C(0xf060bde30205daee)
 		};
 		static const std::uint64_t RangeHashes[16] =
 		{
-			UINT64_C(0x24008d8bfa76a702), UINT64_C(0x5b496f03455e289e),
-			UINT64_C(0xf306b510eee84cad), UINT64_C(0xd55aa8c6a0c5307b),
-			UINT64_C(0xbd3cd8fd81e6e714), UINT64_C(0x1bfeb30f52abaef8),
-			UINT64_C(0x34e35e16af45a6ba), UINT64_C(0x44caadc237c42569),
-			UINT64_C(0xe9995113c19309e2), UINT64_C(0x3451f93f91e3fb33),
-			UINT64_C(0x0875316c8af38477), UINT64_C(0xf71e3b82b7b3faa4),
-			UINT64_C(0x45356193c385e75c), UINT64_C(0xc0fc29ea3a6b1bec),
-			UINT64_C(0x544f877b02a3e15b), UINT64_C(0xce17f56323960c72)
+			UINT64_C(0x968764c7690dbbb4), UINT64_C(0xa0ab134a64758faf),
+			UINT64_C(0x4ed4c3e1226563fb), UINT64_C(0x0dbb5eaa687f5c8f),
+			UINT64_C(0x0880f35812239bcd), UINT64_C(0x3fa41fb198d3a7d3),
+			UINT64_C(0x0fc8324f170e9dbe), UINT64_C(0x9f6b6aac0796d3e6),
+			UINT64_C(0x4c32da0c2d437313), UINT64_C(0xd77bac0138f96ba4),
+			UINT64_C(0xd37d4045998d5138), UINT64_C(0x1cc9106cb507b88a),
+			UINT64_C(0xc5887468c6bd0006), UINT64_C(0x00c2efda0b1826d1),
+			UINT64_C(0xa458571acc4542e1), UINT64_C(0x30c1195cbcc6b5ea)
 		};
 
 		for( INT Predictor=0; Predictor<16; ++Predictor )
@@ -139,8 +139,8 @@ namespace
 		};
 		static const SWORD Expected[28] =
 		{
-			1, -8, -1, 7, -2, 2, 3, -3, -4, 4, 5, -5, -6, 6,
-			-7, -7, -8, 0, 1, -1, 7, 2, 4, -4, -5, 5, -2, -6
+			-8, 1, 7, -1, 2, -2, -3, 3, 4, -4, -5, 5, 6, -6,
+			-7, -7, 0, -8, -1, 1, 2, 7, -4, 4, 5, -5, -6, -2
 		};
 		BYTE Block[15];
 		SWORD Output[28];
@@ -185,8 +185,8 @@ namespace
 		};
 		static const SWORD Expected[28] =
 		{
-			1, -8, -1, 7, -2, 2, 3, -3, -4, 4, 5, -5, -6, 6,
-			-7, -7, -8, 0, 1, -1, 7, 2, 4, -4, -5, 5, -2, -6
+			-8, 1, 7, -1, 2, -2, -3, 3, 4, -4, -5, 5, 6, -6,
+			-7, -7, 0, -8, -1, 1, 2, 7, -4, 4, 5, -5, -6, -2
 		};
 		BYTE Block[15];
 		SWORD Output[30];
@@ -207,7 +207,7 @@ namespace
 
 	static void TestMalformedFeedIsTransactional()
 	{
-		BYTE Block[15] = { 0x0c, 0x21, 0x43, 0x65, 0x07, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 };
+		BYTE Block[15] = { 0x0c, 0x12, 0x34, 0x56, 0x70, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 };
 		SWORD Output[5];
 		FEAXABlockDecoder Decoder;
 		Require( Decoder.Feed(Block, 15, 5) != 0, "valid baseline Feed rejected" );
